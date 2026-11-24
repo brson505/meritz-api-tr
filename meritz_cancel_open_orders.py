@@ -246,10 +246,11 @@ def main() -> None:
 
     # ---- 선택 ---------------------------------------------------------------
     try:
-        raw = input("취소할 번호를 입력하세요 (예: 1,3 / 2-4 / all, 엔터=종료): ")
-        if not raw.strip():
-            print("종료합니다.")
-            return
+        raw = "all"
+        #raw = input("취소할 번호를 입력하세요 (예: 1,3 / 2-4 / all, 엔터=종료): ")
+        #if not raw.strip():
+        #    print("종료합니다.")
+        #    return
         targets = [orders[i] for i in parse_selection(raw, len(orders))]
     except ValueError as e:
         raise SystemExit(f"입력 오류: {e}") from None
@@ -260,9 +261,9 @@ def main() -> None:
         side_txt = "매수" if str(r["deal_cls_code"]) == "2" else "매도"
         print(f"  - 주문 {int(r['oder_no'])} · {r['kor_issu_abwr_name']} {side_txt} "
               f"{int(r['oder_unpr']):,}원 × 미체결 {int(r['ncnt_qty']):,}주")
-    if input("진행하려면 yes 를 입력하세요: ").strip().lower() != "yes":
-        print("취소하지 않고 종료합니다.")
-        return
+    #if input("진행하려면 yes 를 입력하세요: ").strip().lower() != "yes":
+    #    print("취소하지 않고 종료합니다.")
+    #    return
 
     results = cancel_selected(targets, a.exch)
 

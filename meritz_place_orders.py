@@ -231,9 +231,9 @@ def main() -> None:
         print("\n[미리보기] 전송하지 않았습니다. 실제로 주문하려면 --yes 를 붙이세요.")
         return
 
-    if input(f"\n위 {len(orders)}건을 실제로 주문합니다. 진행하려면 yes 를 입력하세요: ").strip().lower() != "yes":
-        print("주문하지 않고 종료합니다.")
-        return
+    #if input(f"\n위 {len(orders)}건을 실제로 주문합니다. 진행하려면 yes 를 입력하세요: ").strip().lower() != "yes":
+    #    print("주문하지 않고 종료합니다.")
+    #    return
 
     results = send_all(orders, a.exch, a.stop_on_error)
 
