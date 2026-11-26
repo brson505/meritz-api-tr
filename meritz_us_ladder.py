@@ -1,4 +1,4 @@
-"""메리츠증권 Open API — 미국 주식 '기준가 -x% 매수 / +y% 매도' 반복 매매
+"""메리츠증권 Open API — 미국 주식 '기준가 -x% 매수 / +y% 매도' 반복 매매 (실시간 웹소켓)
 
   python meritz_us_ladder.py AAPL 1 -1.0% +3.0% --exch NASDAQ                      # 계획만 출력
   python meritz_us_ladder.py AAPL 1 -1.0% +3.0% --exch NASDAQ --yes                # 실행 (고정 지정가)
@@ -14,7 +14,7 @@
   한쪽이 체결되면 반대쪽을 취소하고, 체결된 '주문 가격'을 새 기준가로 삼아 다시 건다.
 
 모드 2 — 트레일링 (--trailing-stop 0.1%)
-  주문을 미리 걸어 두지 않고 현재가를 계속 보면서 추적한다.
+  주문을 미리 걸어 두지 않고 실시간 체결 시세를 계속 보면서 추적한다.
     매수: 가격이 매수 목표(기준가 −1.0%) 이하로 내려가면 최저점을 추적하다가,
           최저점 대비 0.1% 반등하면 매수 주문을 낸다.
     매도: 가격이 매도 목표(기준가 +3.0%) 이상으로 오르면 최고점을 추적하다가,
@@ -22,6 +22,15 @@
   주문은 '현재가에서 --slippage(기본 0.1%) 만큼 불리하게' 잡은 지정가로 냅니다(체결 보장용).
   --fill-timeout(기본 30초) 안에 체결되지 않으면 취소하고 다시 추적합니다.
   체결되면 주문을 낸 시점의 현재가를 새 기준가로 삼는다. 이후 같은 방식으로 반복.
+
+실시간 웹소켓 (기본)
+  시세   : 해외주식 현재가(정규장) 'ohhts_exst_cntg' 를 구독해 체결이 올 때마다 판단한다 (트레일링).
+  체결통보: 'ohhts_cntg_rslt' 를 구독해 알림이 오면 곧바로 주문내역을 확인한다.
+           알림은 '신호'로만 씁니다 — 체결 여부의 근거는 항상 주문내역 조회입니다.
+           알림이 오지 않아도 --poll 초마다 주문내역을 확인하므로 동작에는 지장이 없습니다.
+  연결이 끊기면 자동으로 다시 연결해 구독합니다. 정규장 시세만 받습니다
+  (주간거래·애프터마켓 시세는 다른 구독 코드라 이 프로그램은 구독하지 않습니다).
+  --no-ws 를 주면 웹소켓 없이 예전처럼 REST 로 주기적으로 확인합니다.
 
 매도 규칙 (중요)
   이 프로그램은 '자기가 산 수량'(+ --position 으로 알려 준 수량)만 매도합니다.
@@ -34,6 +43,7 @@
   --max-fills     체결이 이만큼 나면 멈춘다.                (기본: 20)
   Ctrl+C / 오류 / 이상 상황 → 걸어 둔 주문을 취소하고 종료 (--keep-orders 면 그대로 둠)
   애매한 상황(양쪽 동시 체결, 일부 체결 후 취소 등)에서는 자동으로 계속하지 않고 멈춥니다.
+  지연 시세(dely_yn=1)가 오면 트레일링은 멈춥니다 (지연된 가격으로 주문하지 않기 위해).
 
 !! 운영 서버로 실제 주문이 나갑니다. 하락장에서는 -x% 마다 계속 사게 되어
    --max-position 까지 손실이 커질 수 있습니다. 주문은 당일 유효 주문일 수 있어
@@ -41,7 +51,7 @@
    트레일링 모드는 프로그램이 켜져 있고 시세를 받는 동안에만 동작합니다 (꺼지면 보호 주문도 없음).
 
 준비
-  pip install requests
+  pip install requests websockets
   export MERITZ_APP_KEY=발급받은_앱키
   export MERITZ_APP_SECRET=발급받은_시크릿
   (meritz_cancel_order.py, meritz_us_orders.py, meritz_us_cancel.py 와 같은 폴더에 두세요)
@@ -49,15 +59,20 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import csv
+import json
+import os
+import queue
 import re
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 import requests
@@ -80,13 +95,23 @@ CENT = Decimal("0.01")
 KST = ZoneInfo("Asia/Seoul")
 MAX_UNFILLED = 5   # 트레일링 주문이 연속으로 체결되지 않으면 멈춘다
 
+WS_URL = os.getenv("MERITZ_WS_URL", "wss://openapi.imeritz.com:29443/websocket")
+TICK_TR = "ohhts_exst_cntg"    # (실시간) 해외주식 현재가 (정규장)
+FILL_TR = "ohhts_cntg_rslt"    # (실시간) 주문 체결 통보
+# 다시 연결해도 소용없는 오류 — 토큰/구독 코드/세션 한도 문제
+FATAL_WS_CODES = {"EGW00103", "EGW00121", "EGW00202", "WSC00106", "WSC00108", "WSC00110"}
+
 
 class StopBot(Exception):
     """이상 상황. 걸어 둔 주문을 정리하고 멈춘다."""
 
 
+class FeedError(Exception):
+    """웹소켓에서 다시 연결해도 해결되지 않는 오류."""
+
+
 # --------------------------------------------------------------------------- #
-# 시세 / 잔고 (조회 전용)
+# 시세 / 잔고 (REST, 조회 전용)
 # --------------------------------------------------------------------------- #
 def _get(path: str, params: dict[str, str]) -> dict:
     resp = requests.get(
@@ -146,6 +171,175 @@ def get_holdings(symbol: str) -> tuple[Decimal, Decimal]:
 
 
 # --------------------------------------------------------------------------- #
+# 실시간 웹소켓
+# --------------------------------------------------------------------------- #
+class Feed(threading.Thread):
+    """웹소켓 수신 스레드. 연결이 끊기면 스스로 다시 연결하고 구독한다.
+
+    - 체결 시세(TICK_TR)는 self.ticks 큐에 가격으로 쌓는다. (tick_key 가 있을 때만 구독)
+    - 주문 체결 통보(FILL_TR)는 내용을 읽지 않고 self.fill_event 만 켠다 — 주문내역을 곧바로 확인하라는 신호.
+    """
+
+    def __init__(self, tick_key: str | None, log: Callable[..., None]):
+        super().__init__(daemon=True, name="ws-feed")
+        self.tick_key = tick_key
+        self.log = log
+        self.ticks: queue.Queue[Decimal] = queue.Queue()
+        self.fill_event = threading.Event()
+        self.fills_seen = 0
+        self.last_tick = 0.0          # 마지막 시세 수신 시각 (monotonic)
+        self.connected = False
+        self.delayed = False          # 지연 시세(dely_yn=1) 수신 여부
+        self.fatal: str | None = None
+        self._halt = threading.Event()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._task: asyncio.Task | None = None
+        self._ws: Any = None
+
+    # ---- 메시지 ------------------------------------------------------------
+    @staticmethod
+    def _sub(token: str, tr_cd: str, tr_key: str | None, tr_type: str = "1") -> str:
+        body: dict[str, str] = {"tr_cd": tr_cd}
+        if tr_key:
+            body["tr_key"] = tr_key
+        return json.dumps({"header": {"token": f"Bearer {token}", "tr_type": tr_type}, "body": body})
+
+    def _handle(self, raw: str | bytes) -> None:
+        try:
+            msg = json.loads(raw)
+        except ValueError:
+            return
+        if not isinstance(msg, dict):
+            return
+        header = msg.get("header") or {}
+
+        # 오류는 봉투 없이 최상위로 온다.
+        if "rsp_cd" in msg and not header:
+            text = f"{msg['rsp_cd']} — {msg.get('rsp_msg')}"
+            if str(msg["rsp_cd"]) in FATAL_WS_CODES:
+                raise FeedError(text)
+            raise RuntimeError(text)          # 일시적일 수 있으니 다시 연결해 본다
+
+        # 구독 응답에는 header.rsp_cd 가 있고, 데이터에는 없다.
+        if "rsp_cd" in header:
+            code, tr = str(header["rsp_cd"]), header.get("tr_cd")
+            if code == "00000":
+                self.log("WS", f"구독 완료 — {tr or ''}".rstrip(" —"))
+                return
+            text = f"구독 실패 {code} — {header.get('rsp_msg')} ({tr or '?'})"
+            if tr == FILL_TR or (tr is None and not self.tick_key):
+                self.log("WS", text + " — 체결통보 없이 주문내역 조회만으로 계속합니다.")
+                return
+            raise FeedError(text)
+
+        body = msg.get("body")
+        if not isinstance(body, dict):
+            return                              # keepalive 등 빈 프레임
+        tr = header.get("tr_cd") or (TICK_TR if "prpr" in body else None)
+        if tr == TICK_TR:
+            try:
+                price = Decimal(str(body.get("prpr") or "0"))
+            except InvalidOperation:
+                return
+            if price <= 0:
+                return
+            if str(body.get("dely_yn")) == "1":
+                self.delayed = True
+            self.last_tick = time.monotonic()
+            self.ticks.put(price)
+        elif tr == FILL_TR:
+            self.fills_seen += 1
+            self.fill_event.set()
+
+    # ---- 연결 루프 -----------------------------------------------------------
+    async def _main(self) -> None:
+        import websockets
+        loop = asyncio.get_running_loop()
+        backoff = 1.0
+        while not self._halt.is_set():
+            err = "연결이 종료되었습니다"
+            try:
+                token = await loop.run_in_executor(None, get_token)
+                async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20) as ws:
+                    self._ws = ws
+                    self.connected = True
+                    self.log("WS", "연결됨")
+                    if self.tick_key:
+                        await ws.send(self._sub(token, TICK_TR, self.tick_key))
+                    await ws.send(self._sub(token, FILL_TR, None))
+                    backoff = 1.0
+                    async for raw in ws:
+                        self._handle(raw)
+            except asyncio.CancelledError:
+                raise
+            except FeedError as e:
+                self.fatal = str(e)
+                return
+            except Exception as e:                     # 연결 실패·끊김·일시 오류 → 재연결
+                err = f"{type(e).__name__}: {e}"
+            self._ws = None
+            self.connected = False
+            if self._halt.is_set():
+                return
+            self.log("WS끊김", f"{err} — {backoff:g}초 뒤 다시 연결합니다.")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
+
+    def run(self) -> None:
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        self._task = self._loop.create_task(self._main())
+        try:
+            self._loop.run_until_complete(self._task)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:                         # 예상 밖 오류는 메인이 알 수 있게 남긴다
+            self.fatal = f"{type(e).__name__}: {e}"
+        finally:
+            self.connected = False
+            self._loop.close()
+
+    # ---- 메인 스레드에서 쓰는 함수 ---------------------------------------------
+    async def _close(self) -> None:
+        ws = self._ws
+        if ws is not None:
+            try:
+                await ws.close()          # 정상 종료(1000) — 수신 루프가 끝나고 _main 이 빠져나온다
+            except Exception:
+                pass
+        elif self._task is not None:
+            self._task.cancel()           # 연결 중이거나 재연결 대기 중
+
+    def stop(self) -> None:
+        self._halt.set()
+        if self._loop and not self._loop.is_closed():
+            try:
+                asyncio.run_coroutine_threadsafe(self._close(), self._loop)
+            except RuntimeError:
+                pass
+
+    def check(self, required: bool = True) -> None:
+        """치명적인 문제가 있으면 StopBot. required=False 면 체결통보용이라 계속 진행한다."""
+        if not required:
+            return
+        if self.fatal:
+            raise StopBot(f"웹소켓 오류: {self.fatal}")
+        if self.delayed:
+            raise StopBot("지연 시세(dely_yn=1)가 수신되고 있습니다. 지연된 가격으로는 트레일링 주문을 내지 않습니다. "
+                          "실시간 시세 권한을 확인하세요.")
+        if not self.is_alive() and not self._halt.is_set():
+            raise StopBot("웹소켓 수신 스레드가 종료되었습니다.")
+
+    def drain(self) -> None:
+        """쌓여 있던 오래된 시세를 버린다 (주문하며 기다린 사이의 시세)."""
+        while True:
+            try:
+                self.ticks.get_nowait()
+            except queue.Empty:
+                return
+
+
+# --------------------------------------------------------------------------- #
 # 가격 계산
 # --------------------------------------------------------------------------- #
 def target_prices(base: Decimal, down: Decimal, up: Decimal) -> tuple[Decimal, Decimal]:
@@ -187,23 +381,44 @@ class Ladder:
         self.partial: dict[str, Decimal] = {}
         self.ext: dict[str, Decimal | None] = {"buy": None, "sell": None}   # 트레일링 극값(최저/최고)
         self.unfilled = 0
+        self.feed: Feed | None = None                     # 웹소켓 (--no-ws 면 None)
+        self.fired = False                                # 방금 트레일링 주문을 냈는가 (오래된 시세 정리용)
+        self._io = threading.Lock()                       # 웹소켓 스레드와 로그를 함께 쓰므로
+        self._last_say = 0.0
         self.log_path = Path(f"us_ladder_{self.symbol}_{datetime.now(KST):%Y%m%d_%H%M%S}.csv")
 
     # ---- 기록 --------------------------------------------------------------
     def say(self, msg: str) -> None:
         """화면에만 출력 (CSV 에는 남기지 않는다)."""
-        print(f"[{datetime.now(KST):%Y-%m-%d %H:%M:%S}] {msg}")
+        with self._io:
+            print(f"[{datetime.now(KST):%Y-%m-%d %H:%M:%S}] {msg}")
+
+    def say_throttled(self, msg: str, every: float = 1.0) -> None:
+        """시세가 초당 여러 번 와도 화면이 넘치지 않게 1초에 한 번만 출력."""
+        now = time.monotonic()
+        if now - self._last_say >= every:
+            self._last_say = now
+            self.say(msg)
 
     def log(self, event: str, msg: str = "", **kw: Any) -> None:
         ts = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{ts}] {event:<8} {msg}")
-        new = not self.log_path.exists()
-        with self.log_path.open("a", newline="", encoding="utf-8-sig") as f:
-            w = csv.writer(f)
-            if new:
-                w.writerow(["time", "event", "message", "base", "position", "fills", "detail"])
-            w.writerow([ts, event, msg, self.base, self.position, self.fills,
-                        " ".join(f"{k}={v}" for k, v in kw.items())])
+        with self._io:
+            print(f"[{ts}] {event:<8} {msg}")
+            new = not self.log_path.exists()
+            with self.log_path.open("a", newline="", encoding="utf-8-sig") as f:
+                w = csv.writer(f)
+                if new:
+                    w.writerow(["time", "event", "message", "base", "position", "fills", "detail"])
+                w.writerow([ts, event, msg, self.base, self.position, self.fills,
+                            " ".join(f"{k}={v}" for k, v in kw.items())])
+
+    def nap(self, sec: float) -> None:
+        """잠깐 기다린다. 웹소켓이 있으면 체결 통보가 오는 즉시 깨어난다."""
+        if self.feed is not None:
+            if self.feed.fill_event.wait(sec):
+                self.feed.fill_event.clear()
+        else:
+            time.sleep(sec)
 
     # ---- 주문내역 ----------------------------------------------------------
     def history(self) -> list[dict]:
@@ -357,9 +572,11 @@ class Ladder:
                 raise StopBot(f"체결 처리 중 오류: {e} — 상태를 수동으로 확인하세요.") from None
 
     # ======================= 모드 2: 트레일링 =======================
-    def step_trailing(self) -> None:
+    def step_trailing(self, price: Decimal | None = None) -> None:
+        """시세 한 건을 처리한다. price 가 없으면(--no-ws) REST 로 현재가를 조회한다."""
         assert self.trailing is not None
-        price = get_price(self.symbol, self.exch)          # 실시간 시세 (실패하면 run() 이 재시도)
+        if price is None:
+            price = get_price(self.symbol, self.exch)   # 실패하면 run() 이 재시도
         buy_t, sell_t = target_prices(self.base, self.down, self.up)
         if buy_t < 1:
             raise StopBot(f"매수 목표 ${buy_t} — 1달러 미만 종목은 호가단위가 달라 지원하지 않습니다.")
@@ -376,7 +593,7 @@ class Ladder:
             if prev is None or price < prev:
                 self.ext["buy"] = price
                 if prev is not None:
-                    self.say(f"매수 추적: 최저점 ${price} → 반등 ${price * (1 + t):.4f} 이상이면 매수")
+                    self.say_throttled(f"매수 추적: 최저점 ${price} → 반등 ${price * (1 + t):.4f} 이상이면 매수")
         if can_sell and price >= sell_t:
             prev = self.ext["sell"]
             if prev is None:
@@ -384,7 +601,7 @@ class Ladder:
             if prev is None or price > prev:
                 self.ext["sell"] = price
                 if prev is not None:
-                    self.say(f"매도 추적: 최고점 ${price} → 하락 ${price * (1 - t):.4f} 이하이면 매도")
+                    self.say_throttled(f"매도 추적: 최고점 ${price} → 하락 ${price * (1 - t):.4f} 이하이면 매도")
 
         # 2) 극값에서 trailing-stop 만큼 되돌렸으면 주문
         low, high = self.ext["buy"], self.ext["sell"]
@@ -401,6 +618,7 @@ class Ladder:
     def fire(self, side: str, price: Decimal) -> None:
         """트레일링 조건 충족 → 체결되기 쉬운 지정가로 주문하고 체결을 기다린다."""
         assert self.trailing is not None
+        self.fired = True
         slip = self.slip / 100
         limit = ((price * (1 + slip)).quantize(CENT, rounding=ROUND_CEILING) if side == "buy"
                  else (price * (1 - slip)).quantize(CENT, rounding=ROUND_FLOOR))
@@ -412,7 +630,7 @@ class Ladder:
 
         filled = Decimal(0)
         while True:
-            time.sleep(1)
+            self.nap(1.0)           # 웹소켓이 있으면 체결 통보가 오는 즉시 깨어난다
             try:
                 rows = self.history()
             except (MeritzError, requests.RequestException):
@@ -464,7 +682,65 @@ class Ladder:
         if self.fills >= self.max_fills:
             raise StopBot(f"--max-fills({self.max_fills}) 에 도달해 종료합니다.")
 
-    # ======================= 공통 =======================
+    # ======================= 실행 루프 =======================
+    def loop_trailing_ws(self) -> None:
+        """웹소켓 시세가 올 때마다 바로 판단한다 (폴링 없음)."""
+        feed = self.feed
+        assert feed is not None
+        started = time.monotonic()
+        last_notice = started
+        while True:
+            feed.check()
+            try:
+                price = feed.ticks.get(timeout=1.0)
+            except queue.Empty:
+                now = time.monotonic()
+                ref = feed.last_tick or started
+                if now - ref >= 60 and now - last_notice >= 60:
+                    last_notice = now
+                    self.log("시세없음", f"{int(now - ref)}초째 체결 시세가 오지 않습니다 "
+                                         f"(장 마감·거래 없음·연결 문제일 수 있음). "
+                                         f"연결 상태: {'연결됨' if feed.connected else '끊김'}")
+                continue
+            self.fired = False
+            try:
+                self.step_trailing(price)
+            except (MeritzError, requests.RequestException) as e:
+                self.log("조회오류", str(e))
+            if self.fired:
+                feed.drain()     # 주문하며 기다린 사이 쌓인 오래된 시세는 버린다
+
+    def loop_resting_ws(self) -> None:
+        """체결 통보가 오면 즉시, 오지 않아도 --poll 초마다 주문내역을 확인한다."""
+        feed = self.feed
+        assert feed is not None
+        quick = 0            # 통보 직후 주문내역 반영이 늦을 수 있어 짧게 몇 번 더 확인
+        warned = False
+        while True:
+            if feed.fatal and not warned:
+                warned = True
+                self.log("WS중단", f"{feed.fatal} — 체결통보 없이 {self.poll:g}초마다 확인합니다.")
+            woke = feed.fill_event.wait(1.0 if quick > 0 else self.poll)
+            if woke:
+                feed.fill_event.clear()
+                quick = 3
+            elif quick > 0:
+                quick -= 1
+            try:
+                self.step_resting()
+            except (MeritzError, requests.RequestException) as e:
+                self.log("조회오류", str(e))
+
+    def loop_polling(self) -> None:
+        """--no-ws: 웹소켓 없이 주기적으로 확인 (예전 방식)."""
+        while True:
+            time.sleep(self.poll)
+            try:
+                self.step()
+            except (MeritzError, requests.RequestException) as e:
+                # 조회 실패는 일시적일 수 있다 — 주문 상태를 모른 채 새 주문을 내지 않고 다시 시도한다.
+                self.log("조회오류", str(e))
+
     def step(self) -> None:
         if self.trailing is None:
             self.step_resting()
@@ -484,15 +760,21 @@ class Ladder:
                                f"(트레일링 {self.trailing}%, 보유 {self.position}, 한도 {self.max_pos})")
         print(f"\n실행 중입니다. 종료하려면 Ctrl+C (걸어 둔 주문은 "
               f"{'그대로 둡니다' if self.keep_orders else '취소하고 종료합니다'}).\n")
-        while True:
-            time.sleep(self.poll)
-            try:
-                self.step()
-            except (MeritzError, requests.RequestException) as e:
-                # 조회 실패는 일시적일 수 있다 — 주문 상태를 모른 채 새 주문을 내지 않고 다시 시도한다.
-                self.log("조회오류", str(e))
+        if self.feed is None:
+            self.loop_polling()
+        elif self.trailing is not None:
+            self.loop_trailing_ws()
+        else:
+            self.loop_resting_ws()
 
     def shutdown(self) -> None:
+        try:
+            self._shutdown_orders()
+        finally:
+            if self.feed is not None:
+                self.feed.stop()
+
+    def _shutdown_orders(self) -> None:
         if not self.orders:
             return
         if self.keep_orders:
@@ -539,7 +821,7 @@ def parse_args() -> tuple[argparse.Namespace, Decimal, Decimal]:
         (pcts if PCT_RE.match(t) and prev not in VALUE_OPTS else rest).append(t)
 
     p = argparse.ArgumentParser(
-        description="미국 주식 기준가 −x% 매수 / +y% 매도 반복 매매",
+        description="미국 주식 기준가 −x% 매수 / +y% 매도 반복 매매 (실시간 웹소켓)",
         epilog="예) python meritz_us_ladder.py AAPL 1 -1.0% +3.0% --exch NASDAQ --trailing-stop 0.1%",
     )
     p.add_argument("symbol", help="심볼 (예: AAPL)")
@@ -552,7 +834,10 @@ def parse_args() -> tuple[argparse.Namespace, Decimal, Decimal]:
     p.add_argument("--position", type=int, default=0, help="이미 보유 중이며 매도해도 되는 수량 (기본 0)")
     p.add_argument("--max-position", type=int, help="보유 한도(주). 기본: 주문수량 × 5")
     p.add_argument("--max-fills", type=int, default=20, help="체결이 이만큼 나면 종료 (기본 20)")
-    p.add_argument("--poll", type=float, help="확인 주기(초). 기본: 고정 5초 / 트레일링 2초")
+    p.add_argument("--poll", type=float,
+                   help="주문내역 확인 주기(초). 웹소켓 사용 시 체결통보가 없을 때의 보조 주기 (기본 10), "
+                        "--no-ws 일 때는 고정 5초 / 트레일링 2초")
+    p.add_argument("--no-ws", action="store_true", help="웹소켓을 쓰지 않고 REST 로 주기적으로 확인 (예전 방식)")
     p.add_argument("--delayed", action="store_true", help="시작 가격 조회에 실시간 대신 지연 시세 사용")
     p.add_argument("--keep-orders", action="store_true", help="종료할 때 걸어 둔 주문을 취소하지 않음")
     p.add_argument("--yes", action="store_true", help="실제로 실행 (없으면 계획만 출력)")
@@ -598,8 +883,10 @@ def parse_args() -> tuple[argparse.Namespace, Decimal, Decimal]:
     if a.trailing is not None and a.delayed:
         p.error("트레일링은 실시간 시세로만 동작합니다. --delayed 와 함께 쓸 수 없습니다.")
 
-    a.poll = a.poll if a.poll is not None else (5.0 if a.trailing is None else 2.0)
-    a.poll = max(a.poll, 2.0 if a.trailing is None else 1.0)
+    a.ws = not a.no_ws
+    if a.poll is None:
+        a.poll = (10.0 if a.trailing is None else 2.0) if a.ws else (5.0 if a.trailing is None else 2.0)
+    a.poll = max(a.poll, 1.0 if (a.trailing is not None and not a.ws) else 2.0)
     return a, down, up
 
 
@@ -607,6 +894,13 @@ def main() -> None:
     a, down, up = parse_args()
     a.exch_name = EXCH_NAME[a.exch_code]
     trailing = a.trailing is not None
+
+    if a.ws:
+        try:
+            import websockets  # noqa: F401
+        except ImportError:
+            raise SystemExit("웹소켓을 쓰려면 websockets 가 필요합니다: pip install websockets "
+                             "(또는 --no-ws 로 REST 확인 방식을 쓰세요)") from None
 
     # 현재가: --price 가 없으면 필수, 있으면 참고용 (트레일링은 실행 중 시세가 필요하므로 필수)
     current: Decimal | None = None
@@ -630,6 +924,7 @@ def main() -> None:
     if buy_t < 1:
         raise SystemExit(f"매수 목표가 ${buy_t} 로 1달러 미만이라 지원하지 않습니다.")
 
+    tick_key = f"{QUOTE_EXCH[a.exch_code]}@{a.symbol}"
     print(f"\n{a.symbol} ({a.exch_name}) · 1회 {a.qty}주 · "
           f"{'트레일링 ' + str(a.trailing) + '%' if trailing else '고정 지정가'}")
     if a.price is not None:
@@ -648,7 +943,12 @@ def main() -> None:
         print(f"  주문            현재가 ±{a.slippage}% 여유의 지정가 / 체결 대기 {a.fill_timeout:g}초 (미체결이면 취소 후 재추적)")
     print(f"  계좌 보유       {held}주 (매도가능 {sellable}주) · 이 프로그램이 매도할 수량 {a.position}주")
     print(f"  보유 한도       {a.max_position}주 (한도까지 사면 약 ${base * a.max_position:,.2f} 투입)")
-    print(f"  종료 조건       체결 {a.max_fills}회 / 확인 주기 {a.poll:g}초")
+    if a.ws:
+        what = f"실시간 체결 시세({tick_key}) + 체결통보" if trailing else "체결통보 신호 + 주문내역 확인"
+        print(f"  확인 방식       웹소켓 — {what} (보조 확인 {a.poll:g}초)")
+    else:
+        print(f"  확인 방식       REST 폴링 {a.poll:g}초 (--no-ws)")
+    print(f"  종료 조건       체결 {a.max_fills}회")
 
     # 기준가와 시세가 어긋난 경우 미리 알린다
     if current is not None and a.price is not None:
@@ -673,6 +973,10 @@ def main() -> None:
 
     bot = Ladder(a, down, up)
     try:
+        if a.ws:
+            # 트레일링은 체결 시세를, 고정 지정가 모드는 체결통보만 구독한다.
+            bot.feed = Feed(tick_key if trailing else None, bot.log)
+            bot.feed.start()
         bot.run(base)
     except KeyboardInterrupt:
         print()
@@ -681,7 +985,8 @@ def main() -> None:
         bot.log("중단", str(e))
     finally:
         bot.shutdown()
-        print(f"\n종료. 이 프로그램 기준 보유 {bot.position}주, 누적 체결 {bot.fills}회. 로그: {bot.log_path}")
+        extra = f", 체결통보 {bot.feed.fills_seen}건 수신" if bot.feed is not None else ""
+        print(f"\n종료. 이 프로그램 기준 보유 {bot.position}주, 누적 체결 {bot.fills}회{extra}. 로그: {bot.log_path}")
         print("※ 실제 보유 수량은 잔고/주문내역에서 꼭 확인하세요.")
 
 
