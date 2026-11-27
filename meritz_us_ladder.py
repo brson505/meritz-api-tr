@@ -1,4 +1,7 @@
-"""메리츠증권 Open API — 미국 주식 '기준가 -x% 매수 / +y% 매도' 반복 매매 (실시간 웹소켓)
+"""메리츠증권 Open API — 미국 주식 '기준가 -x% 매수 / +y% 매도' 반복 매매 엔진 (실시간 웹소켓)
+
+이 파일은 (1) 매매 엔진(Ladder, Feed)과 (2) 한 종목을 명령행으로 돌리는 프로그램입니다.
+여러 종목을 CSV 파일로 돌리려면 meritz_us_ladder_file.py 를 쓰세요 (이 엔진을 가져다 씁니다).
 
   python meritz_us_ladder.py AAPL 1 -1.0% +3.0% --exch NASDAQ                      # 계획만 출력
   python meritz_us_ladder.py AAPL 1 -1.0% +3.0% --exch NASDAQ --yes                # 실행 (고정 지정가)
@@ -101,6 +104,8 @@ FILL_TR = "ohhts_cntg_rslt"    # (실시간) 주문 체결 통보
 # 다시 연결해도 소용없는 오류 — 토큰/구독 코드/세션 한도 문제
 FATAL_WS_CODES = {"EGW00103", "EGW00121", "EGW00202", "WSC00106", "WSC00108", "WSC00110"}
 
+_IO = threading.Lock()         # 여러 종목 스레드가 화면·로그 파일을 함께 쓰므로
+
 
 class StopBot(Exception):
     """이상 상황. 걸어 둔 주문을 정리하고 멈춘다."""
@@ -144,13 +149,13 @@ def get_price(symbol: str, exch: str, delayed: bool = False) -> Decimal:
     # 잘못된 심볼·거래소는 오류 없이 종목코드가 비고 가격이 0 으로 온다.
     price = Decimal(str(data.get("prpr") or "0"))
     if not data.get("iscd") or price <= 0:
-        raise MeritzError(f"{symbol} 시세를 가져오지 못했습니다. 심볼과 --exch 를 확인하세요.")
+        raise MeritzError(f"{symbol} 시세를 가져오지 못했습니다. 심볼과 거래소를 확인하세요.")
     return price
 
 
-def get_holdings(symbol: str) -> tuple[Decimal, Decimal]:
-    """(보유수량, 매도가능수량). 대출 잔고는 제외하고 해당 심볼만 합산한다."""
-    held = sellable = Decimal(0)
+def get_all_holdings() -> dict[str, tuple[Decimal, Decimal]]:
+    """계좌의 해외 보유 종목 전체 → {심볼: (보유수량, 매도가능수량)}. 대출 잔고는 제외."""
+    out: dict[str, tuple[Decimal, Decimal]] = {}
     params: dict[str, str] = {}
     seen: set[str] = set()
     for _ in range(20):
@@ -158,43 +163,58 @@ def get_holdings(symbol: str) -> tuple[Decimal, Decimal]:
         if body.get("rsp_cd") not in ("5766", "5820", "5762"):
             raise MeritzError(f"잔고 오류 {body.get('rsp_cd')} — {body.get('rsp_msg')}")
         for r in body.get("data") or []:
-            if str(r.get("rmnd_clcd")) == "3" or str(r.get("ovrs_stck_symb_iscd")).upper() != symbol:
+            if str(r.get("rmnd_clcd")) == "3":
                 continue
-            held += Decimal(str(r.get("rmnd_dqty") or "0"))
-            sellable += Decimal(str(r.get("seln_able_dqty") or "0"))
+            sym = str(r.get("ovrs_stck_symb_iscd")).upper()
+            held, sell = out.get(sym, (Decimal(0), Decimal(0)))
+            out[sym] = (held + Decimal(str(r.get("rmnd_dqty") or "0")),
+                        sell + Decimal(str(r.get("seln_able_dqty") or "0")))
         key = body.get("tr_cont_key")
         if body.get("tr_cont") != "1" or not key or key in seen:
             break
         seen.add(key)
         params = {"tr_cont": "1", "tr_cont_key": key}   # 키는 한 글자도 고치지 않는다
-    return held, sellable
+    return out
+
+
+def get_holdings(symbol: str) -> tuple[Decimal, Decimal]:
+    """(보유수량, 매도가능수량) — 한 종목."""
+    return get_all_holdings().get(symbol.upper(), (Decimal(0), Decimal(0)))
 
 
 # --------------------------------------------------------------------------- #
 # 실시간 웹소켓
 # --------------------------------------------------------------------------- #
 class Feed(threading.Thread):
-    """웹소켓 수신 스레드. 연결이 끊기면 스스로 다시 연결하고 구독한다.
+    """웹소켓 수신 스레드. 연결이 끊기면 스스로 다시 연결하고 구독한다. 여러 종목을 한 연결로 받는다.
 
-    - 체결 시세(TICK_TR)는 self.ticks 큐에 가격으로 쌓는다. (tick_key 가 있을 때만 구독)
-    - 주문 체결 통보(FILL_TR)는 내용을 읽지 않고 self.fill_event 만 켠다 — 주문내역을 곧바로 확인하라는 신호.
+    - 체결 시세(TICK_TR)는 종목별 큐(queue_for)에 가격으로 쌓는다. (tick_keys 에 있는 종목만 구독)
+    - 주문 체결 통보(FILL_TR)는 내용을 읽지 않고 등록된 이벤트(add_listener)만 켠다 —
+      주문내역을 곧바로 확인하라는 신호.
     """
 
-    def __init__(self, tick_key: str | None, log: Callable[..., None]):
+    def __init__(self, tick_keys: list[str], log: Callable[..., None]):
         super().__init__(daemon=True, name="ws-feed")
-        self.tick_key = tick_key
+        self.tick_keys = list(dict.fromkeys(tick_keys))
         self.log = log
-        self.ticks: queue.Queue[Decimal] = queue.Queue()
-        self.fill_event = threading.Event()
+        self.queues: dict[str, queue.Queue[Decimal]] = {k: queue.Queue() for k in self.tick_keys}
+        self.listeners: list[threading.Event] = []
         self.fills_seen = 0
-        self.last_tick = 0.0          # 마지막 시세 수신 시각 (monotonic)
+        self.last_tick: dict[str, float] = {}      # 종목별 마지막 시세 수신 시각 (monotonic)
+        self.delayed_keys: set[str] = set()        # 지연 시세(dely_yn=1)가 온 종목
+        self.key_errors: dict[str, str] = {}       # 종목별 구독 실패 사유
         self.connected = False
-        self.delayed = False          # 지연 시세(dely_yn=1) 수신 여부
         self.fatal: str | None = None
         self._halt = threading.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._task: asyncio.Task | None = None
         self._ws: Any = None
+
+    def queue_for(self, key: str) -> "queue.Queue[Decimal]":
+        return self.queues[key]
+
+    def add_listener(self, ev: threading.Event) -> None:
+        self.listeners.append(ev)
 
     # ---- 메시지 ------------------------------------------------------------
     @staticmethod
@@ -203,6 +223,20 @@ class Feed(threading.Thread):
         if tr_key:
             body["tr_key"] = tr_key
         return json.dumps({"header": {"token": f"Bearer {token}", "tr_type": tr_type}, "body": body})
+
+    def _route(self, header: dict, body: dict) -> str | None:
+        """시세 메시지가 어느 종목의 것인지 가린다 (body.iscd 또는 header.tr_key)."""
+        cands = [str(body.get("iscd") or ""), str(header.get("tr_key") or "")]
+        for c in cands:
+            if c in self.queues:
+                return c
+        sym = next((c.split("@")[-1].upper() for c in cands if c), "")
+        matches = [k for k in self.queues if k.split("@")[-1].upper() == sym]
+        if len(matches) == 1:
+            return matches[0]
+        if len(self.queues) == 1:
+            return next(iter(self.queues))
+        return None
 
     def _handle(self, raw: str | bytes) -> None:
         try:
@@ -222,13 +256,17 @@ class Feed(threading.Thread):
 
         # 구독 응답에는 header.rsp_cd 가 있고, 데이터에는 없다.
         if "rsp_cd" in header:
-            code, tr = str(header["rsp_cd"]), header.get("tr_cd")
+            code, tr, key = str(header["rsp_cd"]), header.get("tr_cd"), header.get("tr_key")
             if code == "00000":
-                self.log("WS", f"구독 완료 — {tr or ''}".rstrip(" —"))
+                self.log("WS", f"구독 완료 — {tr or ''} {key if key in self.queues else ''}".rstrip())
                 return
-            text = f"구독 실패 {code} — {header.get('rsp_msg')} ({tr or '?'})"
-            if tr == FILL_TR or (tr is None and not self.tick_key):
+            text = f"구독 실패 {code} — {header.get('rsp_msg')} ({tr or '?'} {key or ''})".rstrip()
+            if tr == FILL_TR or (tr is None and not self.tick_keys):
                 self.log("WS", text + " — 체결통보 없이 주문내역 조회만으로 계속합니다.")
+                return
+            if key in self.queues:                 # 그 종목만 시세를 못 받는다 — 그 종목 스레드가 멈춘다
+                self.key_errors[key] = text
+                self.log("WS", text)
                 return
             raise FeedError(text)
 
@@ -237,6 +275,9 @@ class Feed(threading.Thread):
             return                              # keepalive 등 빈 프레임
         tr = header.get("tr_cd") or (TICK_TR if "prpr" in body else None)
         if tr == TICK_TR:
+            key = self._route(header, body)
+            if key is None:
+                return
             try:
                 price = Decimal(str(body.get("prpr") or "0"))
             except InvalidOperation:
@@ -244,12 +285,13 @@ class Feed(threading.Thread):
             if price <= 0:
                 return
             if str(body.get("dely_yn")) == "1":
-                self.delayed = True
-            self.last_tick = time.monotonic()
-            self.ticks.put(price)
+                self.delayed_keys.add(key)
+            self.last_tick[key] = time.monotonic()
+            self.queues[key].put(price)
         elif tr == FILL_TR:
             self.fills_seen += 1
-            self.fill_event.set()
+            for ev in list(self.listeners):
+                ev.set()
 
     # ---- 연결 루프 -----------------------------------------------------------
     async def _main(self) -> None:
@@ -264,8 +306,10 @@ class Feed(threading.Thread):
                     self._ws = ws
                     self.connected = True
                     self.log("WS", "연결됨")
-                    if self.tick_key:
-                        await ws.send(self._sub(token, TICK_TR, self.tick_key))
+                    for key in self.tick_keys:
+                        await ws.send(self._sub(token, TICK_TR, key))
+                        if len(self.tick_keys) > 1:
+                            await asyncio.sleep(0.12)      # 구독 요청도 초당 10건 제한
                     await ws.send(self._sub(token, FILL_TR, None))
                     backoff = 1.0
                     async for raw in ws:
@@ -299,7 +343,7 @@ class Feed(threading.Thread):
             self.connected = False
             self._loop.close()
 
-    # ---- 메인 스레드에서 쓰는 함수 ---------------------------------------------
+    # ---- 다른 스레드에서 쓰는 함수 ---------------------------------------------
     async def _close(self) -> None:
         ws = self._ws
         if ws is not None:
@@ -318,25 +362,18 @@ class Feed(threading.Thread):
             except RuntimeError:
                 pass
 
-    def check(self, required: bool = True) -> None:
-        """치명적인 문제가 있으면 StopBot. required=False 면 체결통보용이라 계속 진행한다."""
-        if not required:
-            return
+    def check(self, key: str | None = None) -> None:
+        """치명적인 문제가 있으면 StopBot. key 를 주면 그 종목의 구독 실패·지연 시세도 본다."""
         if self.fatal:
             raise StopBot(f"웹소켓 오류: {self.fatal}")
-        if self.delayed:
-            raise StopBot("지연 시세(dely_yn=1)가 수신되고 있습니다. 지연된 가격으로는 트레일링 주문을 내지 않습니다. "
-                          "실시간 시세 권한을 확인하세요.")
+        if key is not None:
+            if key in self.key_errors:
+                raise StopBot(f"시세 구독 실패: {self.key_errors[key]}")
+            if key in self.delayed_keys:
+                raise StopBot("지연 시세(dely_yn=1)가 수신되고 있습니다. 지연된 가격으로는 트레일링 주문을 내지 않습니다. "
+                              "실시간 시세 권한을 확인하세요.")
         if not self.is_alive() and not self._halt.is_set():
             raise StopBot("웹소켓 수신 스레드가 종료되었습니다.")
-
-    def drain(self) -> None:
-        """쌓여 있던 오래된 시세를 버린다 (주문하며 기다린 사이의 시세)."""
-        while True:
-            try:
-                self.ticks.get_nowait()
-            except queue.Empty:
-                return
 
 
 # --------------------------------------------------------------------------- #
@@ -365,6 +402,16 @@ class Live:
 
 
 class Ladder:
+    """한 종목의 반복 매매. 여러 종목이면 종목마다 하나씩 만들어 각자 스레드에서 돌린다.
+
+    a(Namespace) 에서 읽는 값
+      필수: symbol, exch_code, qty, position, max_position(None=무제한), max_fills, poll,
+            keep_orders, trailing(None=고정 지정가), slippage, fill_timeout
+      선택: cash(Decimal|None — 잔고현금 장부, None 이면 현금 제한 없음),
+            on_update(callable — 체결로 기준가·잔고가 바뀔 때마다 호출),
+            ask(callable — 경고 확인 질문), stop_event(threading.Event — 종료 요청)
+    """
+
     def __init__(self, a: argparse.Namespace, down: Decimal, up: Decimal):
         self.symbol, self.exch, self.qty = a.symbol, a.exch_code, a.qty
         self.down, self.up = down, up
@@ -373,7 +420,11 @@ class Ladder:
         self.trailing: Decimal | None = a.trailing        # 트레일링 % (None 이면 고정 지정가 모드)
         self.slip: Decimal = a.slippage
         self.fill_timeout: float = a.fill_timeout
-        self.position = Decimal(a.position)               # 이 프로그램이 매도해도 되는 보유 수량
+        self.position = Decimal(a.position)               # 이 프로그램이 매도해도 되는 보유 수량(장부)
+        self.cash: Decimal | None = getattr(a, "cash", None)   # 이 프로그램이 쓸 수 있는 현금(장부)
+        self.on_update: Callable[["Ladder"], None] | None = getattr(a, "on_update", None)
+        self.ask: Callable[[str], str] = getattr(a, "ask", None) or input
+        self.stop_event: threading.Event = getattr(a, "stop_event", None) or threading.Event()
         self.base: Decimal = Decimal(0)
         self.orders: dict[str, Live] = {}
         self.fills = 0
@@ -381,17 +432,28 @@ class Ladder:
         self.partial: dict[str, Decimal] = {}
         self.ext: dict[str, Decimal | None] = {"buy": None, "sell": None}   # 트레일링 극값(최저/최고)
         self.unfilled = 0
+        self.buy_hold = False                             # 현금 부족으로 매수를 보류 중 (체결이 나면 해제)
         self.feed: Feed | None = None                     # 웹소켓 (--no-ws 면 None)
+        self.tick_key: str | None = None
+        self.tick_q: "queue.Queue[Decimal] | None" = None
+        self.fill_event = threading.Event()               # 체결통보 신호 (웹소켓이 켠다)
         self.fired = False                                # 방금 트레일링 주문을 냈는가 (오래된 시세 정리용)
-        self._io = threading.Lock()                       # 웹소켓 스레드와 로그를 함께 쓰므로
         self._last_say = 0.0
         self.log_path = Path(f"us_ladder_{self.symbol}_{datetime.now(KST):%Y%m%d_%H%M%S}.csv")
+
+    def attach_feed(self, feed: Feed, tick_key: str | None) -> None:
+        """웹소켓 연결(공유 가능)을 이 종목에 붙인다. tick_key 가 있으면 그 종목의 시세 큐를 받는다."""
+        self.feed = feed
+        feed.add_listener(self.fill_event)
+        if tick_key:
+            self.tick_key = tick_key
+            self.tick_q = feed.queue_for(tick_key)
 
     # ---- 기록 --------------------------------------------------------------
     def say(self, msg: str) -> None:
         """화면에만 출력 (CSV 에는 남기지 않는다)."""
-        with self._io:
-            print(f"[{datetime.now(KST):%Y-%m-%d %H:%M:%S}] {msg}")
+        with _IO:
+            print(f"[{datetime.now(KST):%Y-%m-%d %H:%M:%S}] {self.symbol:<6} {msg}")
 
     def say_throttled(self, msg: str, every: float = 1.0) -> None:
         """시세가 초당 여러 번 와도 화면이 넘치지 않게 1초에 한 번만 출력."""
@@ -402,42 +464,80 @@ class Ladder:
 
     def log(self, event: str, msg: str = "", **kw: Any) -> None:
         ts = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
-        with self._io:
-            print(f"[{ts}] {event:<8} {msg}")
+        with _IO:
+            print(f"[{ts}] {self.symbol:<6} {event:<8} {msg}")
             new = not self.log_path.exists()
             with self.log_path.open("a", newline="", encoding="utf-8-sig") as f:
                 w = csv.writer(f)
                 if new:
-                    w.writerow(["time", "event", "message", "base", "position", "fills", "detail"])
-                w.writerow([ts, event, msg, self.base, self.position, self.fills,
+                    w.writerow(["time", "event", "message", "base", "position", "cash", "fills", "detail"])
+                w.writerow([ts, event, msg, self.base, self.position,
+                            "" if self.cash is None else self.cash, self.fills,
                             " ".join(f"{k}={v}" for k, v in kw.items())])
+
+    def notify(self) -> None:
+        """기준가·잔고가 바뀌었음을 알린다 (파일 갱신 등). 실패해도 매매는 계속한다."""
+        if self.on_update is not None:
+            try:
+                self.on_update(self)
+            except Exception as e:                 # noqa: BLE001 — 파일 쓰기 오류로 매매를 멈추지 않는다
+                self.log("파일오류", f"{type(e).__name__}: {e}")
 
     def nap(self, sec: float) -> None:
         """잠깐 기다린다. 웹소켓이 있으면 체결 통보가 오는 즉시 깨어난다."""
         if self.feed is not None:
-            if self.feed.fill_event.wait(sec):
-                self.feed.fill_event.clear()
+            if self.fill_event.wait(sec):
+                self.fill_event.clear()
         else:
-            time.sleep(sec)
+            self.stop_event.wait(sec)
 
     # ---- 주문내역 ----------------------------------------------------------
     def history(self) -> list[dict]:
         start = (datetime.now(KST) - timedelta(days=2)).strftime("%Y%m%d")
         return fetch_history(start, "20991231", "0", "0")   # 체결·미체결 모두
 
+    def _rows_of(self, rows: list[dict], live: Live) -> list[dict]:
+        return [r for r in rows
+                if int(r["oder_no"]) == live.oder_no and r["oder_date"] == live.oder_date
+                and _symbol(r["iscd"]).upper() == self.symbol
+                and str(r.get("oder_rctf_cncl_cls_code")) != "2"]
+
     def inspect(self, rows: list[dict], live: Live) -> tuple[bool, Decimal, str | None]:
         """(내역에서 찾았나, 체결수량 합계, 거부 사유). 체결수량은 같은 주문의 모든 행을 합한다."""
-        found, filled, rejected = False, Decimal(0), None
-        for r in rows:
-            if (int(r["oder_no"]) != live.oder_no or r["oder_date"] != live.oder_date
-                    or _symbol(r["iscd"]).upper() != self.symbol
-                    or str(r.get("oder_rctf_cncl_cls_code")) == "2"):
-                continue
-            found = True
+        mine = self._rows_of(rows, live)
+        rejected = None
+        for r in mine:
             if str(r.get("ovrs_stck_oder_stat_cls_code")) in ("1", "2"):
                 rejected = str(r.get("ovrs_stck_rfus_reas") or "거부")
-            filled += Decimal(str(r.get("cntg_dqty") or "0"))
-        return found, filled, rejected
+        return bool(mine), sum((Decimal(str(r.get("cntg_dqty") or "0")) for r in mine), Decimal(0)), rejected
+
+    def fill_amount(self, rows: list[dict], live: Live) -> Decimal:
+        """같은 주문의 체결금액(cntg_camt, 달러) 합계. 못 구하면 0."""
+        return sum((Decimal(str(r.get("cntg_camt") or "0")) for r in self._rows_of(rows, live)), Decimal(0))
+
+    # ---- 장부 ----------------------------------------------------------------
+    def afford(self, price: Decimal) -> bool:
+        """이 가격으로 1회 수량을 살 현금이 장부에 있는가."""
+        return self.cash is None or self.cash >= price * self.qty
+
+    def apply_fill(self, side: str, live: Live, amount: Decimal) -> None:
+        """체결을 장부에 반영한다. 체결금액을 모르면 주문 가격 × 수량으로 계산한다(수수료는 반영하지 않음)."""
+        cost = amount if amount > 0 else live.price * live.qty
+        if side == "buy":
+            self.position += live.qty
+            if self.cash is not None:
+                self.cash -= cost
+        else:
+            self.position -= live.qty
+            if self.cash is not None:
+                self.cash += cost
+        self.fills += 1
+        self.unfilled = 0
+        self.buy_hold = False
+
+    def ledger_text(self) -> str:
+        cash = "" if self.cash is None else f", 잔고현금 ${self.cash:,.2f}"
+        return f"보유 {self.position}{cash}, 누적 체결 {self.fills}"
 
     # ---- 주문 ----------------------------------------------------------------
     def submit(self, side: str, price: Decimal) -> Live:
@@ -448,8 +548,8 @@ class Ladder:
             except MeritzWarning as w:
                 if not w.resendable:
                     raise StopBot(f"{side} 주문이 보류되었습니다: {w}") from None
-                print(f"\n[경고] {side} ${price} × {self.qty}: {w}")
-                if input("  내용을 확인했고 이 주문을 전송하시겠습니까? (y/N) ").strip().lower() != "y":
+                print(f"\n[경고] {self.symbol} {side} ${price} × {self.qty}: {w}")
+                if self.ask("  내용을 확인했고 이 주문을 전송하시겠습니까? (y/N) ").strip().lower() != "y":
                     raise StopBot("경고 확인을 거절해 중단합니다.") from None
                 res = place_order(o, warn_confirmed=True)
         except (requests.Timeout, requests.ConnectionError) as e:
@@ -484,8 +584,8 @@ class Ladder:
             except MeritzWarning as w:
                 if not w.resendable:
                     raise
-                print(f"\n[경고] 취소 {live.side} 주문 {live.oder_no}: {w}")
-                if input("  확인했고 취소를 계속하시겠습니까? (y/N) ").strip().lower() != "y":
+                print(f"\n[경고] {self.symbol} 취소 {live.side} 주문 {live.oder_no}: {w}")
+                if self.ask("  확인했고 취소를 계속하시겠습니까? (y/N) ").strip().lower() != "y":
                     raise StopBot("취소 경고 확인을 거절해 중단합니다.") from None
                 cancel_us_order(row, warn_confirmed=True, confirm=True)
         except (requests.Timeout, requests.ConnectionError) as e:
@@ -495,8 +595,9 @@ class Ladder:
         self.log("취소", f"{live.side} ${live.price} (주문번호 {live.oder_no})")
 
     def limits(self) -> tuple[bool, bool]:
-        """(지금 매수 가능?, 지금 매도 가능?) — 보유 한도와 보유 수량 기준."""
-        return self.position + self.qty <= self.max_pos, self.position >= self.qty
+        """(지금 매수 가능?, 지금 매도 가능?) — 보유 한도와 보유 수량 기준. 현금은 afford() 로 따로 본다."""
+        can_buy = self.max_pos is None or self.position + self.qty <= self.max_pos
+        return can_buy, self.position >= self.qty
 
     # ======================= 모드 1: 고정 지정가 =======================
     def place_pair(self) -> None:
@@ -504,14 +605,16 @@ class Ladder:
         if buy_price < 1:
             raise StopBot(f"매수가 ${buy_price} — 1달러 미만 종목은 호가단위가 달라 지원하지 않습니다.")
         can_buy, can_sell = self.limits()
-        self.log("기준가", f"${self.base} → 매수 ${buy_price} / 매도 ${sell_price} "
-                           f"(보유 {self.position}, 한도 {self.max_pos})")
-        if not can_buy and not can_sell:
-            raise StopBot("매수 한도에 도달했고 매도할 수량도 없어 더 진행할 수 없습니다.")
-        if not can_buy:
+        self.log("기준가", f"${self.base} → 매수 ${buy_price} / 매도 ${sell_price} ({self.ledger_text()})")
+        if can_buy and not self.afford(buy_price):
+            can_buy = False
+            self.log("잔고부족", f"잔고현금 ${self.cash:,.2f} 로는 ${buy_price} × {self.qty} 매수가 안 됩니다 — 매수 주문은 걸지 않습니다.")
+        elif not can_buy:
             self.log("한도", f"보유 한도({self.max_pos}) 도달 — 매수 주문은 걸지 않습니다.")
         if not can_sell:
             self.log("안내", "매도할 보유 수량이 없어 매도 주문은 걸지 않습니다.")
+        if not can_buy and not can_sell:
+            raise StopBot("매수할 현금(또는 한도)도 매도할 수량도 없어 더 진행할 수 없습니다.")
         if can_buy:
             self.orders["buy"] = self.submit("buy", buy_price)
         if can_sell:
@@ -519,12 +622,14 @@ class Ladder:
         self.missing = {"buy": 0, "sell": 0}
         self.partial = {}
 
-    def on_fill(self, side: str) -> None:
+    def on_fill(self, side: str, amount: Decimal) -> None:
         live = self.orders.pop(side)
-        self.position += self.qty if side == "buy" else -self.qty
-        self.fills += 1
+        self.apply_fill(side, live, amount)
+        self.base = live.price   # 체결된 '주문 가격'이 새 기준가
         self.log("체결", f"{'매수' if side == 'buy' else '매도'} ${live.price} × {live.qty} "
-                         f"(주문번호 {live.oder_no}) → 보유 {self.position}, 누적 체결 {self.fills}")
+                         f"(주문번호 {live.oder_no}, 체결금액 ${amount if amount > 0 else live.price * live.qty:,.2f}) "
+                         f"→ {self.ledger_text()}")
+        self.notify()            # 장부·기준가를 먼저 저장한다 (이후 단계에서 멈춰도 기록은 남도록)
 
         other_side = "sell" if side == "buy" else "buy"
         other = self.orders.get(other_side)
@@ -541,7 +646,6 @@ class Ladder:
                 raise StopBot(f"취소한 {other_side} 주문이 {after}주 체결되어 있습니다. "
                               f"보유 수량이 계산과 다를 수 있어 수동 확인이 필요합니다.")
 
-        self.base = live.price   # 체결된 '주문 가격'이 새 기준가
         if self.fills >= self.max_fills:
             raise StopBot(f"--max-fills({self.max_fills}) 에 도달해 종료합니다.")
         self.place_pair()
@@ -566,7 +670,7 @@ class Ladder:
             raise StopBot("두 주문이 모두 체결되었습니다. 수동 확인이 필요합니다.")
         if done:
             try:
-                self.on_fill(done[0])
+                self.on_fill(done[0], self.fill_amount(rows, self.orders[done[0]]))
             except (MeritzError, requests.RequestException) as e:
                 # 체결 처리는 중간에 멈추면 보유 수량·주문 상태가 어긋난다 — 재시도하지 않고 멈춘다.
                 raise StopBot(f"체결 처리 중 오류: {e} — 상태를 수동으로 확인하세요.") from None
@@ -581,8 +685,11 @@ class Ladder:
         if buy_t < 1:
             raise StopBot(f"매수 목표 ${buy_t} — 1달러 미만 종목은 호가단위가 달라 지원하지 않습니다.")
         can_buy, can_sell = self.limits()
+        slip = self.slip / 100
+        if can_buy and (self.buy_hold or not self.afford(buy_t * (1 + slip))):
+            can_buy = False       # 현금이 모자라 이 기준가에서는 살 수 없다 (매도 체결로 현금이 생기면 풀린다)
         if not can_buy and not can_sell:
-            raise StopBot("매수 한도에 도달했고 매도할 수량도 없어 더 진행할 수 없습니다.")
+            raise StopBot("매수할 현금(또는 한도)도 매도할 수량도 없어 더 진행할 수 없습니다.")
         t = self.trailing / 100
 
         # 1) 목표에 닿으면 추적 시작, 이후 더 유리한 쪽으로 가면 극값 갱신
@@ -618,19 +725,27 @@ class Ladder:
     def fire(self, side: str, price: Decimal) -> None:
         """트레일링 조건 충족 → 체결되기 쉬운 지정가로 주문하고 체결을 기다린다."""
         assert self.trailing is not None
-        self.fired = True
         slip = self.slip / 100
         limit = ((price * (1 + slip)).quantize(CENT, rounding=ROUND_CEILING) if side == "buy"
                  else (price * (1 - slip)).quantize(CENT, rounding=ROUND_FLOOR))
+        if side == "buy" and not self.afford(limit):
+            # 반등 가격이 목표보다 높아져 현금이 모자라게 된 경우 — 주문하지 않고 매도 체결로 현금이 생길 때까지 보류
+            self.ext["buy"] = None
+            self.buy_hold = True
+            self.log("잔고부족", f"잔고현금 ${self.cash:,.2f} 로는 ${limit} × {self.qty} 매수가 안 됩니다 — 매수를 보류합니다.")
+            return
+        self.fired = True
         self.log("트리거", f"{side}: 극값 ${self.ext[side]} → 현재 ${price} (트레일링 {self.trailing}%) "
                            f"— 지정가 ${limit} 주문")
         live = self.submit(side, limit)
-        self.orders[side] = live    # 기다리는 동안 Ctrl+C 가 와도 정리할 수 있게 등록
+        self.orders[side] = live    # 기다리는 동안 종료 요청이 와도 정리할 수 있게 등록
         deadline = time.time() + self.fill_timeout
 
         filled = Decimal(0)
         while True:
             self.nap(1.0)           # 웹소켓이 있으면 체결 통보가 오는 즉시 깨어난다
+            if self.stop_event.is_set():
+                raise StopBot("종료 요청 — 걸어 둔 주문을 정리합니다.")
             try:
                 rows = self.history()
             except (MeritzError, requests.RequestException):
@@ -669,33 +784,36 @@ class Ladder:
                 raise StopBot(f"트레일링 주문이 연속 {MAX_UNFILLED}번 체결되지 않아 멈춥니다.")
             return
 
-        # 체결됨
+        # 체결됨 — 체결금액을 다시 조회해 장부에 반영한다
+        try:
+            amount = self.fill_amount(self.history(), live)
+        except (MeritzError, requests.RequestException):
+            amount = Decimal(0)
         self.orders.pop(side, None)
-        self.position += self.qty if side == "buy" else -self.qty
-        self.fills += 1
-        self.unfilled = 0
+        self.apply_fill(side, live, amount)
         self.base = price      # 주문을 낸 시점의 현재가가 새 기준가
         self.ext = {"buy": None, "sell": None}
         self.log("체결", f"{'매수' if side == 'buy' else '매도'} 지정가 ${limit} × {live.qty} "
-                         f"(주문번호 {live.oder_no}) → 보유 {self.position}, 누적 체결 {self.fills}, "
-                         f"새 기준가 ${self.base}")
+                         f"(주문번호 {live.oder_no}, 체결금액 ${amount if amount > 0 else limit * live.qty:,.2f}) "
+                         f"→ {self.ledger_text()}, 새 기준가 ${self.base}")
+        self.notify()
         if self.fills >= self.max_fills:
             raise StopBot(f"--max-fills({self.max_fills}) 에 도달해 종료합니다.")
 
     # ======================= 실행 루프 =======================
     def loop_trailing_ws(self) -> None:
         """웹소켓 시세가 올 때마다 바로 판단한다 (폴링 없음)."""
-        feed = self.feed
-        assert feed is not None
+        feed, q = self.feed, self.tick_q
+        assert feed is not None and q is not None and self.tick_key is not None
         started = time.monotonic()
         last_notice = started
-        while True:
-            feed.check()
+        while not self.stop_event.is_set():
+            feed.check(self.tick_key)
             try:
-                price = feed.ticks.get(timeout=1.0)
+                price = q.get(timeout=1.0)
             except queue.Empty:
                 now = time.monotonic()
-                ref = feed.last_tick or started
+                ref = feed.last_tick.get(self.tick_key) or started
                 if now - ref >= 60 and now - last_notice >= 60:
                     last_notice = now
                     self.log("시세없음", f"{int(now - ref)}초째 체결 시세가 오지 않습니다 "
@@ -708,7 +826,11 @@ class Ladder:
             except (MeritzError, requests.RequestException) as e:
                 self.log("조회오류", str(e))
             if self.fired:
-                feed.drain()     # 주문하며 기다린 사이 쌓인 오래된 시세는 버린다
+                while True:      # 주문하며 기다린 사이 쌓인 오래된 시세는 버린다
+                    try:
+                        q.get_nowait()
+                    except queue.Empty:
+                        break
 
     def loop_resting_ws(self) -> None:
         """체결 통보가 오면 즉시, 오지 않아도 --poll 초마다 주문내역을 확인한다."""
@@ -716,16 +838,23 @@ class Ladder:
         assert feed is not None
         quick = 0            # 통보 직후 주문내역 반영이 늦을 수 있어 짧게 몇 번 더 확인
         warned = False
-        while True:
+        last_step = time.monotonic()
+        while not self.stop_event.is_set():
             if feed.fatal and not warned:
                 warned = True
                 self.log("WS중단", f"{feed.fatal} — 체결통보 없이 {self.poll:g}초마다 확인합니다.")
-            woke = feed.fill_event.wait(1.0 if quick > 0 else self.poll)
+            woke = self.fill_event.wait(1.0)          # 1초마다 깨어나 종료 요청을 확인한다
+            now = time.monotonic()
             if woke:
-                feed.fill_event.clear()
-                quick = 3
+                self.fill_event.clear()
+                quick, due = 3, True
             elif quick > 0:
-                quick -= 1
+                quick, due = quick - 1, True
+            else:
+                due = now - last_step >= self.poll
+            if not due:
+                continue
+            last_step = now
             try:
                 self.step_resting()
             except (MeritzError, requests.RequestException) as e:
@@ -733,8 +862,9 @@ class Ladder:
 
     def loop_polling(self) -> None:
         """--no-ws: 웹소켓 없이 주기적으로 확인 (예전 방식)."""
-        while True:
-            time.sleep(self.poll)
+        while not self.stop_event.is_set():
+            if self.stop_event.wait(self.poll):
+                return
             try:
                 self.step()
             except (MeritzError, requests.RequestException) as e:
@@ -757,9 +887,7 @@ class Ladder:
         else:
             buy_t, sell_t = target_prices(self.base, self.down, self.up)
             self.log("기준가", f"${self.base} → 매수 목표 ${buy_t} / 매도 목표 ${sell_t} "
-                               f"(트레일링 {self.trailing}%, 보유 {self.position}, 한도 {self.max_pos})")
-        print(f"\n실행 중입니다. 종료하려면 Ctrl+C (걸어 둔 주문은 "
-              f"{'그대로 둡니다' if self.keep_orders else '취소하고 종료합니다'}).\n")
+                               f"(트레일링 {self.trailing}%, {self.ledger_text()})")
         if self.feed is None:
             self.loop_polling()
         elif self.trailing is not None:
@@ -768,13 +896,7 @@ class Ladder:
             self.loop_resting_ws()
 
     def shutdown(self) -> None:
-        try:
-            self._shutdown_orders()
-        finally:
-            if self.feed is not None:
-                self.feed.stop()
-
-    def _shutdown_orders(self) -> None:
+        """걸어 둔 주문을 취소한다 (--keep-orders 면 그대로 둔다). 웹소켓 연결은 건드리지 않는다."""
         if not self.orders:
             return
         if self.keep_orders:
@@ -788,7 +910,8 @@ class Ladder:
         for side, live in list(self.orders.items()):
             _, filled, _ = self.inspect(rows, live) if rows else (False, Decimal(0), None)
             if filled >= live.qty:
-                self.log("주의", f"{side} 주문 {live.oder_no} 은 이미 체결되었습니다. 보유 수량을 확인하세요.")
+                self.log("주의", f"{side} 주문 {live.oder_no} 은 이미 체결되었습니다. 보유 수량을 확인하세요 "
+                                 f"(장부에는 아직 반영되지 않았습니다).")
                 continue
             try:
                 self.cancel(live, filled)
@@ -798,7 +921,7 @@ class Ladder:
 
 
 # --------------------------------------------------------------------------- #
-# 입력
+# 한 종목 명령행 프로그램
 # --------------------------------------------------------------------------- #
 def _pct(p: argparse.ArgumentParser, text: str, name: str, lo: Decimal, hi: Decimal) -> Decimal:
     """'0.1%' 또는 '0.1' → Decimal(0.1). lo < 값 <= hi 가 아니면 오류."""
@@ -972,11 +1095,15 @@ def main() -> None:
         return
 
     bot = Ladder(a, down, up)
+    feed: Feed | None = None
     try:
         if a.ws:
             # 트레일링은 체결 시세를, 고정 지정가 모드는 체결통보만 구독한다.
-            bot.feed = Feed(tick_key if trailing else None, bot.log)
-            bot.feed.start()
+            feed = Feed([tick_key] if trailing else [], bot.log)
+            bot.attach_feed(feed, tick_key if trailing else None)
+            feed.start()
+        print(f"\n실행 중입니다. 종료하려면 Ctrl+C (걸어 둔 주문은 "
+              f"{'그대로 둡니다' if a.keep_orders else '취소하고 종료합니다'}).\n")
         bot.run(base)
     except KeyboardInterrupt:
         print()
@@ -985,7 +1112,9 @@ def main() -> None:
         bot.log("중단", str(e))
     finally:
         bot.shutdown()
-        extra = f", 체결통보 {bot.feed.fills_seen}건 수신" if bot.feed is not None else ""
+        if feed is not None:
+            feed.stop()
+        extra = f", 체결통보 {feed.fills_seen}건 수신" if feed is not None else ""
         print(f"\n종료. 이 프로그램 기준 보유 {bot.position}주, 누적 체결 {bot.fills}회{extra}. 로그: {bot.log_path}")
         print("※ 실제 보유 수량은 잔고/주문내역에서 꼭 확인하세요.")
 
