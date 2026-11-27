@@ -35,6 +35,11 @@
   (주간거래·애프터마켓 시세는 다른 구독 코드라 이 프로그램은 구독하지 않습니다).
   --no-ws 를 주면 웹소켓 없이 예전처럼 REST 로 주기적으로 확인합니다.
 
+트레일링 상태 출력 (--show-trail)
+  추적을 시작하면 시세가 올 때마다 '현재가 · 최저/최고 · 주문이 나가는 트리거 가격'을 출력합니다.
+  추적을 시작하기 전(목표에 닿기 전)에는 --status-every 초(기본 10)마다 현재가와 목표까지의 거리를 출력합니다.
+  매수 불가(잔고현금 부족·보유 한도)나 매도 불가(잔고수량 부족)인 쪽은 그 사유를 함께 보여 줍니다.
+
 매도 규칙 (중요)
   이 프로그램은 '자기가 산 수량'(+ --position 으로 알려 준 수량)만 매도합니다.
   처음에 보유 수량이 0 이면 매도는 첫 매수가 체결된 뒤부터 시작됩니다.
@@ -425,6 +430,9 @@ class Ladder:
         self.on_update: Callable[["Ladder"], None] | None = getattr(a, "on_update", None)
         self.ask: Callable[[str], str] = getattr(a, "ask", None) or input
         self.stop_event: threading.Event = getattr(a, "stop_event", None) or threading.Event()
+        self.show_trail: bool = bool(getattr(a, "show_trail", False))      # 추적 중일 때마다 상태를 출력
+        self.status_every: float = float(getattr(a, "status_every", 0) or 0)   # 대기 중 상태를 출력하는 주기(초)
+        self._last_status = 0.0
         self.base: Decimal = Decimal(0)
         self.orders: dict[str, Live] = {}
         self.fills = 0
@@ -594,6 +602,35 @@ class Ladder:
             raise StopBot(f"{live.side} 주문 {live.oder_no} 취소 실패: {e}") from None
         self.log("취소", f"{live.side} ${live.price} (주문번호 {live.oder_no})")
 
+    def trail_sides(self, buy_t: Decimal) -> tuple[bool, bool, str, str]:
+        """트레일링에서 지금 추적할 수 있는 쪽. (매수 가능, 매도 가능, 매수 불가 사유, 매도 불가 사유)"""
+        can_buy, can_sell = self.limits()
+        buy_note = "" if can_buy else "보유 한도"
+        if can_buy and (self.buy_hold or not self.afford(buy_t * (1 + self.slip / 100))):
+            can_buy, buy_note = False, "잔고현금 부족"     # 매도 체결로 현금이 생기면 풀린다
+        return can_buy, can_sell, buy_note, ("" if can_sell else "잔고수량 부족")
+
+    def trail_line(self, price: Decimal, low: Decimal | None, high: Decimal | None, t: Decimal) -> None:
+        """--show-trail: 추적 중인 쪽의 극값과 주문 트리거 가격을 시세가 올 때마다 출력한다."""
+        parts = []
+        if low is not None:
+            trig = low * (1 + t)
+            parts.append(f"매수 추적중 · 최저 ${low} → 반등 ${trig:.4f} 이상이면 매수 (현재가 대비 {(trig / price - 1) * 100:+.3f}%)")
+        if high is not None:
+            trig = high * (1 - t)
+            parts.append(f"매도 추적중 · 최고 ${high} → 하락 ${trig:.4f} 이하이면 매도 (현재가 대비 {(trig / price - 1) * 100:+.3f}%)")
+        self.say(f"트레일링 · 현재가 ${price} · " + " | ".join(parts))
+
+    def wait_line(self, price: Decimal, buy_t: Decimal, sell_t: Decimal, buy_note: str, sell_note: str) -> None:
+        """추적을 시작하기 전(목표에 닿기 전) 상태를 --status-every 초마다 출력한다."""
+        now = time.monotonic()
+        if self.status_every <= 0 or now - self._last_status < self.status_every:
+            return
+        self._last_status = now
+        b = f"매수목표 ${buy_t} ({(buy_t / price - 1) * 100:+.2f}%)" + (f" [매수 불가: {buy_note}]" if buy_note else "")
+        s = f"매도목표 ${sell_t} ({(sell_t / price - 1) * 100:+.2f}%)" + (f" [매도 불가: {sell_note}]" if sell_note else "")
+        self.say(f"트레일링 대기 · 현재가 ${price} · {b} · {s} — 목표에 닿으면 추적을 시작합니다")
+
     def limits(self) -> tuple[bool, bool]:
         """(지금 매수 가능?, 지금 매도 가능?) — 보유 한도와 보유 수량 기준. 현금은 afford() 로 따로 본다."""
         can_buy = self.max_pos is None or self.position + self.qty <= self.max_pos
@@ -684,10 +721,7 @@ class Ladder:
         buy_t, sell_t = target_prices(self.base, self.down, self.up)
         if buy_t < 1:
             raise StopBot(f"매수 목표 ${buy_t} — 1달러 미만 종목은 호가단위가 달라 지원하지 않습니다.")
-        can_buy, can_sell = self.limits()
-        slip = self.slip / 100
-        if can_buy and (self.buy_hold or not self.afford(buy_t * (1 + slip))):
-            can_buy = False       # 현금이 모자라 이 기준가에서는 살 수 없다 (매도 체결로 현금이 생기면 풀린다)
+        can_buy, can_sell, buy_note, sell_note = self.trail_sides(buy_t)
         if not can_buy and not can_sell:
             raise StopBot("매수할 현금(또는 한도)도 매도할 수량도 없어 더 진행할 수 없습니다.")
         t = self.trailing / 100
@@ -699,7 +733,7 @@ class Ladder:
                 self.log("추적시작", f"매수: 현재가 ${price} ≤ 매수목표 ${buy_t} — 최저점을 추적합니다.")
             if prev is None or price < prev:
                 self.ext["buy"] = price
-                if prev is not None:
+                if prev is not None and not self.show_trail:
                     self.say_throttled(f"매수 추적: 최저점 ${price} → 반등 ${price * (1 + t):.4f} 이상이면 매수")
         if can_sell and price >= sell_t:
             prev = self.ext["sell"]
@@ -707,13 +741,17 @@ class Ladder:
                 self.log("추적시작", f"매도: 현재가 ${price} ≥ 매도목표 ${sell_t} — 최고점을 추적합니다.")
             if prev is None or price > prev:
                 self.ext["sell"] = price
-                if prev is not None:
+                if prev is not None and not self.show_trail:
                     self.say_throttled(f"매도 추적: 최고점 ${price} → 하락 ${price * (1 - t):.4f} 이하이면 매도")
 
         # 2) 극값에서 trailing-stop 만큼 되돌렸으면 주문
         low, high = self.ext["buy"], self.ext["sell"]
         buy_fire = low is not None and price >= low * (1 + t)
         sell_fire = high is not None and price <= high * (1 - t)
+        if low is None and high is None:
+            self.wait_line(price, buy_t, sell_t, buy_note, sell_note)     # 아직 목표에 닿지 않음
+        elif self.show_trail:
+            self.trail_line(price, low, high, t)                          # 추적 중
         if buy_fire and sell_fire:
             raise StopBot("매수·매도 트리거가 동시에 발생했습니다. 시세를 확인하세요.")
         if buy_fire or sell_fire:
@@ -888,6 +926,12 @@ class Ladder:
             buy_t, sell_t = target_prices(self.base, self.down, self.up)
             self.log("기준가", f"${self.base} → 매수 목표 ${buy_t} / 매도 목표 ${sell_t} "
                                f"(트레일링 {self.trailing}%, {self.ledger_text()})")
+            cb, cs, bn, sn = self.trail_sides(buy_t)
+            self.log("추적대상", f"매수 {'가능' if cb else '불가 (' + bn + ')'} · 매도 {'가능' if cs else '불가 (' + sn + ')'} — "
+                                 f"{'매수 목표 $' + str(buy_t) + ' 이하' if cb else ''}"
+                                 f"{' / ' if cb and cs else ''}"
+                                 f"{'매도 목표 $' + str(sell_t) + ' 이상' if cs else ''}"
+                                 f"에 닿으면 추적을 시작합니다")
         if self.feed is None:
             self.loop_polling()
         elif self.trailing is not None:
@@ -961,6 +1005,10 @@ def parse_args() -> tuple[argparse.Namespace, Decimal, Decimal]:
                    help="주문내역 확인 주기(초). 웹소켓 사용 시 체결통보가 없을 때의 보조 주기 (기본 10), "
                         "--no-ws 일 때는 고정 5초 / 트레일링 2초")
     p.add_argument("--no-ws", action="store_true", help="웹소켓을 쓰지 않고 REST 로 주기적으로 확인 (예전 방식)")
+    p.add_argument("--show-trail", action="store_true",
+                   help="트레일링으로 추적 중일 때 시세가 올 때마다 상태(극값·트리거 가격)를 출력")
+    p.add_argument("--status-every", type=float,
+                   help="추적 시작 전(대기 중) 상태를 출력하는 주기(초). 기본: --show-trail 이면 10, 아니면 출력 안 함. 0 이면 끔")
     p.add_argument("--delayed", action="store_true", help="시작 가격 조회에 실시간 대신 지연 시세 사용")
     p.add_argument("--keep-orders", action="store_true", help="종료할 때 걸어 둔 주문을 취소하지 않음")
     p.add_argument("--yes", action="store_true", help="실제로 실행 (없으면 계획만 출력)")
@@ -1006,6 +1054,10 @@ def parse_args() -> tuple[argparse.Namespace, Decimal, Decimal]:
     if a.trailing is not None and a.delayed:
         p.error("트레일링은 실시간 시세로만 동작합니다. --delayed 와 함께 쓸 수 없습니다.")
 
+    if a.status_every is not None and a.status_every < 0:
+        p.error("--status-every 는 0 이상이어야 합니다.")
+    if a.status_every is None:
+        a.status_every = 10.0 if a.show_trail else 0.0
     a.ws = not a.no_ws
     if a.poll is None:
         a.poll = (10.0 if a.trailing is None else 2.0) if a.ws else (5.0 if a.trailing is None else 2.0)

@@ -17,6 +17,11 @@
   잔고수량       이 종목에서 매도해도 되는 수량. 이 안에서만 매도한다
   '#' 으로 시작하는 줄과 빈 줄은 무시하고, 파일을 갱신할 때 그대로 둡니다.
 
+트레일링 상태 출력
+  --show-trail      추적을 시작한 종목은 시세가 올 때마다 '현재가 · 최저/최고 · 주문 트리거 가격'을 출력
+  --status-every N  추적을 시작하기 전(목표에 닿기 전)에는 N초마다 현재가와 목표까지의 거리를 출력
+                    (--show-trail 을 주면 기본 10초, 0 이면 끔). 매수/매도가 불가한 쪽은 사유를 함께 보여 줌.
+
 동작
   종목마다 meritz_us_ladder.py 의 매매 엔진이 따로(스레드) 돌고, 웹소켓 연결은 하나를 같이 씁니다.
     고정 지정가: 기준가 −x% 매수 / +y% 매도 주문을 걸어 두고, 한쪽이 체결되면 반대쪽을 취소하고
@@ -328,6 +333,10 @@ def main() -> None:
     p.add_argument("--max-fills", type=int, default=20, help="종목별로 체결이 이만큼 나면 그 종목을 멈춤 (기본 20)")
     p.add_argument("--poll", type=float, default=10.0, help="주문내역 보조 확인 주기(초, 기본 10)")
     p.add_argument("--no-ws", action="store_true", help="웹소켓 없이 REST 로 주기적으로 확인")
+    p.add_argument("--show-trail", action="store_true",
+                   help="트레일링으로 추적 중일 때 시세가 올 때마다 상태(극값·트리거 가격)를 출력")
+    p.add_argument("--status-every", type=float,
+                   help="추적 시작 전(대기 중) 상태를 출력하는 주기(초). 기본: --show-trail 이면 10, 아니면 출력 안 함. 0 이면 끔")
     p.add_argument("--keep-orders", action="store_true", help="종료할 때 걸어 둔 주문을 취소하지 않음")
     p.add_argument("--yes", action="store_true", help="실제로 실행 (없으면 계획만 출력)")
     a = p.parse_args()
@@ -337,6 +346,10 @@ def main() -> None:
         p.error("--slippage 값을 숫자로 읽을 수 없습니다.")
     if not (0 <= slippage <= 5) or a.fill_timeout < 5 or a.max_fills < 1:
         p.error("--slippage(0~5), --fill-timeout(5초 이상), --max-fills(1 이상) 값을 확인하세요.")
+    if a.status_every is not None and a.status_every < 0:
+        p.error("--status-every 는 0 이상이어야 합니다.")
+    if a.status_every is None:
+        a.status_every = 10.0 if a.show_trail else 0.0
 
     if not a.no_ws:
         try:
@@ -382,6 +395,9 @@ def main() -> None:
     print(f"\n실행 대상 {len(plans)}개 · 종목별 최대 체결 {a.max_fills}회 · "
           f"확인 방식 {'REST 폴링' if a.no_ws else '웹소켓(시세·체결통보) + 보조 확인 ' + str(a.poll) + '초'}")
     print("체결될 때마다 이 파일의 기준가격·잔고현금·잔고수량이 갱신됩니다.")
+    if a.show_trail or a.status_every > 0:
+        print(f"트레일링 상태 출력: 추적 중이면 시세마다{'' if a.show_trail else ' (꺼짐)'}, "
+              f"대기 중이면 {a.status_every:g}초마다{'' if a.status_every > 0 else ' (꺼짐)'}")
 
     if not a.yes:
         print("\n[계획만 출력] 주문하지 않았습니다. 실제로 실행하려면 --yes 를 붙이세요.")
@@ -410,6 +426,7 @@ def main() -> None:
             max_fills=a.max_fills, poll=a.poll if not a.no_ws else max(a.poll, 2.0),
             keep_orders=a.keep_orders, trailing=sp.trailing, slippage=slippage, fill_timeout=a.fill_timeout,
             cash=sp.cash, on_update=make_updater(sp), ask=ask, stop_event=stop,
+            show_trail=a.show_trail, status_every=a.status_every,
         )
         bots.append((sp, Ladder(ns, sp.down, sp.up)))
 
