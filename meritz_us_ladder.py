@@ -761,8 +761,12 @@ class Ladder:
 
         # 2) 극값에서 trailing-stop 만큼 되돌렸으면 주문
         low, high = self.ext["buy"], self.ext["sell"]
-        buy_fire = low is not None and price >= low * (1 + t)
-        sell_fire = high is not None and price <= high * (1 - t)
+        if t == 0:   # 0%: 극값을 지난 뒤 처음으로 반대로 움직이면(오르다 내리면 매도, 내리다 오르면 매수) 바로 주문
+            buy_fire = low is not None and price > low
+            sell_fire = high is not None and price < high
+        else:
+            buy_fire = low is not None and price >= low * (1 + t)
+            sell_fire = high is not None and price <= high * (1 - t)
         if low is None and high is None:
             self.wait_line(price, buy_t, sell_t, buy_note, sell_note)     # 아직 목표에 닿지 않음
         elif self.show_trail:
@@ -983,14 +987,15 @@ class Ladder:
 # --------------------------------------------------------------------------- #
 # 한 종목 명령행 프로그램
 # --------------------------------------------------------------------------- #
-def _pct(p: argparse.ArgumentParser, text: str, name: str, lo: Decimal, hi: Decimal) -> Decimal:
+def _pct(p: argparse.ArgumentParser, text: str, name: str, lo: Decimal, hi: Decimal,
+         lo_inclusive: bool = False) -> Decimal:
     """'0.1%' 또는 '0.1' → Decimal(0.1). lo < 값 <= hi 가 아니면 오류."""
     try:
         v = Decimal(str(text).strip().rstrip("%"))
     except InvalidOperation:
         p.error(f"{name} 값 '{text}' 을 숫자로 읽을 수 없습니다. 예: 0.1%")
-    if not (lo < v <= hi):
-        p.error(f"{name} 은 {lo}% 초과 {hi}% 이하여야 합니다 (받은 값: {text}).")
+    if not ((lo <= v if lo_inclusive else lo < v) and v <= hi):
+        p.error(f"{name} 은 {lo}% {'이상' if lo_inclusive else '초과'} {hi}% 이하여야 합니다 (받은 값: {text}).")
     return v
 
 
@@ -1011,7 +1016,7 @@ def parse_args() -> tuple[argparse.Namespace, Decimal, Decimal]:
     p.add_argument("qty", type=int, help="1회 주문 수량(주)")
     p.add_argument("--exch", required=True, help="거래소 NASDAQ / NYSE / AMEX")
     p.add_argument("--price", help="기준가를 현재가 대신 이 값으로 지정 (예: 100.00)")
-    p.add_argument("--trailing-stop", dest="trailing", help="트레일링 스톱 폭 (예: 0.1%%). 지정하면 추적 후 주문")
+    p.add_argument("--trailing-stop", dest="trailing", help="트레일링 스톱 폭 (예: 0.1%%). 지정하면 추적 후 주문, 0 이면 극값을 지나 처음 반대로 움직일 때 주문")
     p.add_argument("--slippage", default="0.1%", help="트레일링 주문 지정가 여유 (기본 0.1%%)")
     p.add_argument("--fill-timeout", type=float, default=30.0, help="트레일링 주문 체결 대기(초, 기본 30)")
     p.add_argument("--position", type=int, default=0, help="이미 보유 중이며 매도해도 되는 수량 (기본 0)")
@@ -1061,7 +1066,7 @@ def parse_args() -> tuple[argparse.Namespace, Decimal, Decimal]:
             p.error("--price 는 0보다 커야 합니다.")
 
     # --trailing-stop / --slippage
-    a.trailing = _pct(p, a.trailing, "--trailing-stop", Decimal(0), Decimal(50)) if a.trailing else None
+    a.trailing = _pct(p, a.trailing, "--trailing-stop", Decimal(0), Decimal(50), lo_inclusive=True) if a.trailing is not None else None
     a.slippage = _pct(p, a.slippage, "--slippage", Decimal(-1), Decimal(5))
     if a.slippage < 0:
         p.error("--slippage 는 0% 이상이어야 합니다.")

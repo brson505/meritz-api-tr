@@ -11,7 +11,8 @@
   종목          심볼.거래소 (거래소: NASDAQ / NYSE / AMEX)
   수량          1회 주문 수량(주)
   매수율/매도율  기준가 대비 % (매수율은 음수, 매도율은 양수)
-  trailing-stop 0.1% 처럼 주면 트레일링(추적 후 주문), 0 이면 고정 지정가를 미리 걸어 둔다
+  trailing-stop 0.1% 처럼 주면 트레일링(추적 후 주문), - 이면 고정 지정가를 미리 걸어 둔다,
+                0 (0%) 이면 트레일링이되 되돌림 폭 없이, 목표 이상 오르다 내리면 매도·목표 이하 내리다 오르면 매수 주문
   기준가격       - 이면 시작할 때의 현재가, 숫자면 그 값
   잔고현금       이 종목에 쓸 수 있는 현금(달러). 이 안에서만 매수한다
   잔고수량       이 종목에서 매도해도 되는 수량. 이 안에서만 매도한다
@@ -225,11 +226,8 @@ class Sheet:
             probs.append(f"매도율 '{self._cell(row, '매도율')}' 은 0% 보다 커야 합니다 (예: +5.0%)")
 
         trailing = dec("trailing-stop", allow=("", "-"))
-        if trailing is not None:
-            if trailing == 0:
-                trailing = None
-            elif not (0 < trailing <= 50):
-                probs.append(f"trailing-stop '{self._cell(row, 'trailing-stop')}' 은 0 (사용 안 함) 또는 50% 이하의 양수여야 합니다")
+        if trailing is not None and not (0 <= trailing <= 50):
+            probs.append(f"trailing-stop '{self._cell(row, 'trailing-stop')}' 은 - (고정 지정가) 또는 0~50% 여야 합니다")
 
         base = dec("기준가격", allow=("", "-"))
         if base is not None and base <= 0:
@@ -291,16 +289,16 @@ def explain(sp: Spec, current: Decimal | None, base: Decimal, sellable: Decimal 
             slippage: Decimal) -> tuple[list[str], bool]:
     """종목 하나의 계획 설명과 경고. 두 번째 값은 '실행 가능한가'."""
     buy_t, sell_t = target_prices(base, sp.down, sp.up)
-    mode = f"트레일링 {sp.trailing}%" if sp.trailing else "고정 지정가"
+    mode = f"트레일링 {sp.trailing}%" if sp.trailing is not None else "고정 지정가"
     lines = [f"{sp.symbol} ({sp.exch_name}) · 1회 {sp.qty}주 · {mode}"]
     src = "현재가" if sp.base is None else "파일의 기준가격"
     lines.append(f"    기준가 ${base} ({src})" +
                  ("" if current is None or sp.base is None else
                   f" · 현재가 ${current} (기준가 대비 {(current / base - 1) * 100:+.2f}%)"))
-    label = "목표" if sp.trailing else "지정가"
+    label = "목표" if sp.trailing is not None else "지정가"
     lines.append(f"    매수 {label} ${buy_t} ({sp.down:+}%) · 매도 {label} ${sell_t} ({sp.up:+}%)")
 
-    est = buy_t * (1 + slippage / 100) if sp.trailing else buy_t
+    est = buy_t * (1 + slippage / 100) if sp.trailing is not None else buy_t
     buyable = int(sp.cash // (est * sp.qty)) * sp.qty if est > 0 else 0
     can_buy, can_sell = buyable >= sp.qty, sp.position >= sp.qty
     lines.append(f"    잔고현금 ${sp.cash:,.2f} → 처음에 매수 {'가능 (약 ' + str(buyable) + '주까지)' if can_buy else '불가'}"
@@ -314,7 +312,7 @@ def explain(sp: Spec, current: Decimal | None, base: Decimal, sellable: Decimal 
     if sellable is not None and sp.position > sellable:
         warns.append(f"잔고수량 {sp.position}주가 계좌 매도가능수량 {sellable}주보다 큽니다 — 매도 주문이 거절될 수 있습니다.")
     if current is not None and sp.base is not None:
-        if sp.trailing:
+        if sp.trailing is not None:
             if current <= buy_t and can_buy:
                 warns.append("현재가가 이미 매수 목표 이하입니다. 시작하자마자 최저점 추적을 시작합니다.")
             if current >= sell_t and can_sell:
@@ -379,7 +377,7 @@ def main() -> None:
         try:
             current = get_price(sp.symbol, sp.exch_code)
         except MeritzError as e:
-            if sp.base is None or sp.trailing:
+            if sp.base is None or sp.trailing is not None:
                 print(f"\n{sp.symbol} ({sp.exch_name}) — 시세를 가져오지 못해 건너뜁니다: {e}")
                 continue
             print(f"\n[참고] {sp.symbol} 현재가를 가져오지 못했습니다({e}). 파일의 기준가격으로 진행합니다.")
@@ -440,9 +438,9 @@ def main() -> None:
                 head = "" if event == "WS" else f"{event:<8} "
                 print(f"[{datetime.now(KST):%Y-%m-%d %H:%M:%S}] {'WS':<6} {head}{msg}")
 
-        feed = Feed([sp.tick_key for sp, _ in bots if sp.trailing], ws_log)
+        feed = Feed([sp.tick_key for sp, _ in bots if sp.trailing is not None], ws_log)
         for sp, bot in bots:
-            bot.attach_feed(feed, sp.tick_key if sp.trailing else None)
+            bot.attach_feed(feed, sp.tick_key if sp.trailing is not None else None)
         feed.start()
 
     bases = {sp.symbol: base for sp, base, _ in plans}
