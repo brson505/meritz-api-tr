@@ -77,6 +77,7 @@ from meritz_us_ladder import (
     MeritzError,
     StopBot,
     get_all_holdings,
+    print_account,
     get_price,
     target_prices,
 )
@@ -365,6 +366,7 @@ def main() -> None:
         raise SystemExit(str(e)) from None
 
     # ---- 시세·잔고 조회 (조회만 한다) ----------------------------------------------
+    print_account()
     try:
         holdings = get_all_holdings()
     except MeritzError as e:

@@ -186,6 +186,73 @@ def get_all_holdings() -> dict[str, tuple[Decimal, Decimal]]:
     return out
 
 
+def _dec(v: Any) -> Decimal:
+    try:
+        return Decimal(str(v if v not in (None, "") else "0").strip())
+    except InvalidOperation:
+        return Decimal(0)
+
+
+def print_account() -> None:
+    """시작할 때 계좌 현황을 보여 준다: 해외 보유 종목(수량), 외화 예수금, 원화 주문가능금액. 조회만 하며,
+    어느 하나가 실패해도 나머지는 보여 주고 프로그램은 계속 진행한다."""
+    print("=" * 70)
+    print("계좌 현황")
+    # 1) 보유 종목
+    try:
+        rows: list[dict] = []
+        params: dict[str, str] = {}
+        seen: set[str] = set()
+        for _ in range(20):
+            body = _get("/accounts/v1/me/overseas/holdings", params)
+            if body.get("rsp_cd") not in ("5766", "5820", "5762"):
+                raise MeritzError(f"{body.get('rsp_cd')} — {body.get('rsp_msg')}")
+            rows += [x for x in body.get("data") or [] if str(x.get("rmnd_clcd")) != "3"]
+            key = body.get("tr_cont_key")
+            if body.get("tr_cont") != "1" or not key or key in seen:
+                break
+            seen.add(key)
+            params = {"tr_cont": "1", "tr_cont_key": key}
+        rows = [x for x in rows if _dec(x.get("rmnd_dqty")) > 0]
+        if not rows:
+            print("  보유 종목: 없음")
+        else:
+            print(f"  보유 종목 {len(rows)}개")
+            for x in rows:
+                ex = {"0537": "NASDAQ", "0321": "NYSE", "0066": "AMEX"}.get(str(x.get("ovrs_exch_vndr_idno")), "")
+                qty, sell = _dec(x.get("rmnd_dqty")).normalize(), _dec(x.get("seln_able_dqty")).normalize()
+                pl, rate = _dec(x.get("vltn_prls_camt")), _dec(x.get("vltn_ert"))
+                print(f"    {str(x.get('ovrs_stck_symb_iscd')):<8}{ex:<7} 보유 {qty:f}주 (매도가능 {sell:f}주) · "
+                      f"평단 ${_dec(x.get('avrg_unpr')):,.4f} · 현재가 ${_dec(x.get('psnt_prc')):,.4f} · "
+                      f"평가손익 {rate:+.2f}% ({x.get('crcd') or 'USD'} {pl:+,.2f}) · {str(x.get('isnm') or '').strip()}")
+    except (MeritzError, requests.RequestException) as e:
+        print(f"  보유 종목: 조회하지 못했습니다 ({e})")
+    # 2) 외화 예수금 (이 값이 해외주식 매수에 쓰는 달러)
+    try:
+        body = _get("/accounts/v1/me/overseas/currencies", {})
+        if body.get("rsp_cd") not in ("5766", "5820", "5762"):
+            raise MeritzError(f"{body.get('rsp_cd')} — {body.get('rsp_msg')}")
+        cur = body.get("data") or []
+        if not cur:
+            print("  외화 예수금: 없음")
+        for c in cur:
+            print(f"  외화 예수금 {c.get('crcd')}: {_dec(c.get('frcr_amt')):,.2f} "
+                  f"(추정 {_dec(c.get('estm_frcr_amt')):,.2f}, 평가환율 {_dec(c.get('vltn_exrt')):,.2f}원)")
+    except (MeritzError, requests.RequestException) as e:
+        print(f"  외화 예수금: 조회하지 못했습니다 ({e})")
+    # 3) 원화 예수금 / 주문가능금액
+    try:
+        body = _get("/accounts/v1/me/deposit", {})
+        if body.get("rsp_cd") != "5766":
+            raise MeritzError(f"{body.get('rsp_cd')} — {body.get('rsp_msg')}")
+        d = body.get("data") or {}
+        print(f"  원화 예수금 ₩{_dec(d.get('tfam')):,.0f} · 주문가능 현금 ₩{_dec(d.get('oder_able_cash_amt')):,.0f} "
+              f"· 출금가능 ₩{_dec(d.get('drng_able_amt')):,.0f}")
+    except (MeritzError, requests.RequestException) as e:
+        print(f"  원화 예수금: 조회하지 못했습니다 ({e})")
+    print("=" * 70)
+
+
 def get_holdings(symbol: str) -> tuple[Decimal, Decimal]:
     """(보유수량, 매도가능수량) — 한 종목."""
     return get_all_holdings().get(symbol.upper(), (Decimal(0), Decimal(0)))
@@ -1099,6 +1166,7 @@ def main() -> None:
                              "(또는 --no-ws 로 REST 확인 방식을 쓰세요)") from None
 
     # 현재가: --price 가 없으면 필수, 있으면 참고용 (트레일링은 실행 중 시세가 필요하므로 필수)
+    print_account()
     current: Decimal | None = None
     try:
         current = get_price(a.symbol, a.exch_code, a.delayed)
