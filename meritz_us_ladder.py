@@ -112,7 +112,13 @@ WS_URL = os.getenv("MERITZ_WS_URL", "wss://openapi.imeritz.com:29443/websocket")
 TICK_TR = "ohhts_exst_cntg"    # (실시간) 해외주식 현재가 (정규장)
 FILL_TR = "ohhts_cntg_rslt"    # (실시간) 주문 체결 통보
 # 다시 연결해도 소용없는 오류 — 토큰/구독 코드/세션 한도 문제
-FATAL_WS_CODES = {"EGW00103", "EGW00121", "EGW00202", "WSC00106", "WSC00108", "WSC00110"}
+FATAL_WS_CODES = {"EGW00103", "EGW00121", "EGW00202", "WSC00106", "WSC00108"}
+SESSION_LIMIT = "WSC00110"     # 같은 앱키로 열린 웹소켓 세션이 한도를 넘음 — 이전 연결이 풀리면 해결되기도 한다
+SESSION_RETRIES = 6            # 세션 한도 오류는 이만큼(× SESSION_WAIT초) 기다려 본 뒤 멈춘다
+SESSION_WAIT = 20.0
+SESSION_HINT = ("같은 앱키로 웹소켓을 쓰는 다른 프로그램이 있습니다. 이전에 실행한 이 프로그램(다른 터미널·창, "
+                "백그라운드·예약 실행), 다른 PC·앱·서버에서 같은 앱키를 쓰는 프로세스를 모두 종료한 뒤 다시 실행하세요. "
+                "방금 종료한 프로세스의 연결은 풀리기까지 1~2분 걸릴 수 있습니다.")
 
 _IO = threading.Lock()         # 여러 종목 스레드가 화면·로그 파일을 함께 쓰므로
 
@@ -282,6 +288,7 @@ class Feed(threading.Thread):
         self.key_errors: dict[str, str] = {}       # 종목별 구독 실패 사유
         self.connected = False
         self.fatal: str | None = None
+        self.session_fails = 0                     # 연속 세션 한도 오류 횟수
         self._halt = threading.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._task: asyncio.Task | None = None
@@ -315,7 +322,15 @@ class Feed(threading.Thread):
             return next(iter(self.queues))
         return None
 
-    def _handle(self, raw: str | bytes) -> None:
+    def _session_limit(self, text: str) -> None:
+        """세션 한도 오류. 몇 번은 기다렸다 다시 연결하고, 계속되면 원인을 알려 주며 멈춘다."""
+        self.session_fails += 1
+        if self.session_fails >= SESSION_RETRIES:
+            raise FeedError(f"{text} — {SESSION_RETRIES}번 다시 연결해도 세션 한도 오류입니다. {SESSION_HINT}")
+        self.log("WS", f"{text} — 세션 한도 초과 ({self.session_fails}/{SESSION_RETRIES}). {SESSION_HINT}")
+        raise RuntimeError(text)
+
+    def _on_message(self, raw: str | bytes) -> None:
         try:
             msg = json.loads(raw)
         except ValueError:
@@ -327,6 +342,8 @@ class Feed(threading.Thread):
         # 오류는 봉투 없이 최상위로 온다.
         if "rsp_cd" in msg and not header:
             text = f"{msg['rsp_cd']} — {msg.get('rsp_msg')}"
+            if str(msg["rsp_cd"]) == SESSION_LIMIT:
+                self._session_limit(text)
             if str(msg["rsp_cd"]) in FATAL_WS_CODES:
                 raise FeedError(text)
             raise RuntimeError(text)          # 일시적일 수 있으니 다시 연결해 본다
@@ -334,7 +351,10 @@ class Feed(threading.Thread):
         # 구독 응답에는 header.rsp_cd 가 있고, 데이터에는 없다.
         if "rsp_cd" in header:
             code, tr, key = str(header["rsp_cd"]), header.get("tr_cd"), header.get("tr_key")
+            if code == SESSION_LIMIT:
+                self._session_limit(f"{code} — {header.get('rsp_msg')} ({tr or '?'} {key or ''})".rstrip())
             if code == "00000":
+                self.session_fails = 0
                 self.log("WS", f"구독 완료 — {tr or ''} {key if key in self.queues else ''}".rstrip())
                 return
             text = f"구독 실패 {code} — {header.get('rsp_msg')} ({tr or '?'} {key or ''})".rstrip()
@@ -390,7 +410,7 @@ class Feed(threading.Thread):
                     await ws.send(self._sub(token, FILL_TR, None))
                     backoff = 1.0
                     async for raw in ws:
-                        self._handle(raw)
+                        self._on_message(raw)
             except asyncio.CancelledError:
                 raise
             except FeedError as e:
@@ -402,6 +422,8 @@ class Feed(threading.Thread):
             self.connected = False
             if self._halt.is_set():
                 return
+            if self.session_fails:                     # 세션 한도: 이전 연결이 풀릴 시간을 준다
+                backoff = max(backoff, SESSION_WAIT)
             self.log("WS끊김", f"{err} — {backoff:g}초 뒤 다시 연결합니다.")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30.0)
