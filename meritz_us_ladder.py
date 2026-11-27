@@ -25,7 +25,8 @@
           최저점 대비 0.1% 반등하면 매수 주문을 낸다.
     매도: 가격이 매도 목표(기준가 +3.0%) 이상으로 오르면 최고점을 추적하다가,
           최고점 대비 0.1% 하락하면 매도 주문을 낸다.
-  주문은 '현재가에서 --slippage(기본 0.1%) 만큼 불리하게' 잡은 지정가로 냅니다(체결 보장용).
+  주문 가격은 현재가가 아니라 목표가입니다 — 매수는 기준가×(1+매수율), 매도는 기준가×(1+매도율) 지정가.
+  (그래서 반등·하락한 현재가가 목표가보다 불리하면 체결되지 않을 수 있고, --fill-timeout 뒤 취소하고 다시 추적합니다.)
   --fill-timeout(기본 30초) 안에 체결되지 않으면 취소하고 다시 추적합니다.
   체결되면 모드 1과 같은 규칙으로 새 기준가를 잡는다 — 매수는 '기존 기준가 × (1 + 매수율)', 매도는 '기존 기준가 / (1 + 매수율)'.
   이후 같은 방식으로 반복.
@@ -687,7 +688,7 @@ class Ladder:
         """트레일링에서 지금 추적할 수 있는 쪽. (매수 가능, 매도 가능, 매수 불가 사유, 매도 불가 사유)"""
         can_buy, can_sell = self.limits()
         buy_note = "" if can_buy else "보유 한도"
-        if can_buy and (self.buy_hold or not self.afford(buy_t * (1 + self.slip / 100))):
+        if can_buy and (self.buy_hold or not self.afford(buy_t)):
             can_buy, buy_note = False, "잔고현금 부족"     # 매도 체결로 현금이 생기면 풀린다
         return can_buy, can_sell, buy_note, ("" if can_sell else "잔고수량 부족")
 
@@ -849,11 +850,10 @@ class Ladder:
     def fire(self, side: str, price: Decimal) -> None:
         """트레일링 조건 충족 → 체결되기 쉬운 지정가로 주문하고 체결을 기다린다."""
         assert self.trailing is not None
-        slip = self.slip / 100
-        limit = ((price * (1 + slip)).quantize(CENT, rounding=ROUND_CEILING) if side == "buy"
-                 else (price * (1 - slip)).quantize(CENT, rounding=ROUND_FLOOR))
+        buy_t, sell_t = target_prices(self.base, self.down, self.up)
+        limit = buy_t if side == "buy" else sell_t     # 주문 가격 = 목표가 (현재가·슬리피지 아님)
         if side == "buy" and not self.afford(limit):
-            # 반등 가격이 목표보다 높아져 현금이 모자라게 된 경우 — 주문하지 않고 매도 체결로 현금이 생길 때까지 보류
+            # 현금이 모자라게 된 경우 — 주문하지 않고 매도 체결로 현금이 생길 때까지 보류
             self.ext["buy"] = None
             self.buy_hold = True
             self.log("잔고부족", f"잔고현금 ${self.cash:,.2f} 로는 ${limit} × {self.qty} 매수가 안 됩니다 — 매수를 보류합니다.")
@@ -1084,7 +1084,7 @@ def parse_args() -> tuple[argparse.Namespace, Decimal, Decimal]:
     p.add_argument("--exch", required=True, help="거래소 NASDAQ / NYSE / AMEX")
     p.add_argument("--price", help="기준가를 현재가 대신 이 값으로 지정 (예: 100.00)")
     p.add_argument("--trailing-stop", dest="trailing", help="트레일링 스톱 폭 (예: 0.1%%). 지정하면 추적 후 주문, 0 이면 극값을 지나 처음 반대로 움직일 때 주문")
-    p.add_argument("--slippage", default="0.1%", help="트레일링 주문 지정가 여유 (기본 0.1%%)")
+    p.add_argument("--slippage", default="0.1%", help="(사용 안 함 — 트레일링 주문은 목표가로 냅니다. 이전 명령어와의 호환용)")
     p.add_argument("--fill-timeout", type=float, default=30.0, help="트레일링 주문 체결 대기(초, 기본 30)")
     p.add_argument("--position", type=int, default=0, help="이미 보유 중이며 매도해도 되는 수량 (기본 0)")
     p.add_argument("--max-position", type=int, help="보유 한도(주). 기본: 주문수량 × 5")
@@ -1204,7 +1204,7 @@ def main() -> None:
     if trailing:
         print(f"  트레일링 방식   매수 목표 이하로 내려간 뒤 최저점 대비 +{a.trailing}% 반등하면 매수,")
         print(f"                  매도 목표 이상으로 오른 뒤 최고점 대비 -{a.trailing}% 하락하면 매도")
-        print(f"  주문            현재가 ±{a.slippage}% 여유의 지정가 / 체결 대기 {a.fill_timeout:g}초 (미체결이면 취소 후 재추적)")
+        print(f"  주문            목표가 지정가 / 체결 대기 {a.fill_timeout:g}초 (미체결이면 취소 후 재추적)")
     print(f"  계좌 보유       {held}주 (매도가능 {sellable}주) · 이 프로그램이 매도할 수량 {a.position}주")
     print(f"  보유 한도       {a.max_position}주 (한도까지 사면 약 ${base * a.max_position:,.2f} 투입)")
     if a.ws:

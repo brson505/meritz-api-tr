@@ -299,7 +299,7 @@ def explain(sp: Spec, current: Decimal | None, base: Decimal, sellable: Decimal 
     label = "목표" if sp.trailing is not None else "지정가"
     lines.append(f"    매수 {label} ${buy_t} ({sp.down:+}%) · 매도 {label} ${sell_t} ({sp.up:+}%)")
 
-    est = buy_t * (1 + slippage / 100) if sp.trailing is not None else buy_t
+    est = buy_t
     buyable = int(sp.cash // (est * sp.qty)) * sp.qty if est > 0 else 0
     can_buy, can_sell = buyable >= sp.qty, sp.position >= sp.qty
     lines.append(f"    잔고현금 ${sp.cash:,.2f} → 처음에 매수 {'가능 (약 ' + str(buyable) + '주까지)' if can_buy else '불가'}"
@@ -329,7 +329,7 @@ def explain(sp: Spec, current: Decimal | None, base: Decimal, sellable: Decimal 
 def main() -> None:
     p = argparse.ArgumentParser(description="CSV 파일로 여러 종목 반복 매매 (실시간 웹소켓)")
     p.add_argument("file", type=Path, help="종목 파일 (CSV)")
-    p.add_argument("--slippage", default="0.1", help="트레일링 주문 지정가 여유 %% (기본 0.1)")
+    p.add_argument("--slippage", default="0.1", help="(사용 안 함 — 트레일링 주문은 목표가로 냅니다)")
     p.add_argument("--fill-timeout", type=float, default=30.0, help="트레일링 주문 체결 대기(초, 기본 30)")
     p.add_argument("--max-fills", type=int, default=20, help="종목별로 체결이 이만큼 나면 그 종목을 멈춤 (기본 20)")
     p.add_argument("--poll", type=float, default=10.0, help="주문내역 보조 확인 주기(초, 기본 10)")
