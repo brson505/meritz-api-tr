@@ -14,7 +14,10 @@
 
 모드 1 — 고정 지정가 (기본)
   기준가 −1.0% 에 지정가 매수, +3.0% 에 지정가 매도 주문을 걸어 둔다.
-  한쪽이 체결되면 반대쪽을 취소하고, 체결된 '주문 가격'을 새 기준가로 삼아 다시 건다.
+  한쪽이 체결되면 반대쪽을 취소하고 새 기준가로 다시 건다.
+  새 기준가: 주문 가격과 무관하게 기존 기준가에서 계산 — 매수 체결이면 '기존 기준가 × (1 + 매수율)',
+  매도 체결이면 '기존 기준가 / (1 + 매수율)'
+  (예: 매수율 -1% 에서 기준가 100 → 매수 후 99, 기준가 99 → 매도 후 100).
 
 모드 2 — 트레일링 (--trailing-stop 0.1%)
   주문을 미리 걸어 두지 않고 실시간 체결 시세를 계속 보면서 추적한다.
@@ -24,7 +27,8 @@
           최고점 대비 0.1% 하락하면 매도 주문을 낸다.
   주문은 '현재가에서 --slippage(기본 0.1%) 만큼 불리하게' 잡은 지정가로 냅니다(체결 보장용).
   --fill-timeout(기본 30초) 안에 체결되지 않으면 취소하고 다시 추적합니다.
-  체결되면 주문을 낸 시점의 현재가를 새 기준가로 삼는다. 이후 같은 방식으로 반복.
+  체결되면 모드 1과 같은 규칙으로 새 기준가를 잡는다 — 매수는 '기존 기준가 × (1 + 매수율)', 매도는 '기존 기준가 / (1 + 매수율)'.
+  이후 같은 방식으로 반복.
 
 실시간 웹소켓 (기본)
   시세   : 해외주식 현재가(정규장) 'ohhts_exst_cntg' 를 구독해 체결이 올 때마다 판단한다 (트레일링).
@@ -543,6 +547,16 @@ class Ladder:
         self.unfilled = 0
         self.buy_hold = False
 
+    def next_base(self, side: str, fill_price: Decimal) -> Decimal:
+        """체결 뒤의 새 기준가.
+        주문 가격은 쓰지 않고 항상 기존 기준가에서 계산한다(고정 지정가·트레일링 동일).
+        매수: 기존 기준가 × (1 + 매수율)  (기준가 100, 매수율 -1% → 99)
+        매도: 기존 기준가 / (1 + 매수율)  (기준가 99, 매수율 -1% → 100)
+        """
+        factor = 1 + self.down / 100
+        new = self.base * factor if side == "buy" else self.base / factor
+        return new.quantize(Decimal("0.0001"))
+
     def ledger_text(self) -> str:
         cash = "" if self.cash is None else f", 잔고현금 ${self.cash:,.2f}"
         return f"보유 {self.position}{cash}, 누적 체결 {self.fills}"
@@ -662,10 +676,11 @@ class Ladder:
     def on_fill(self, side: str, amount: Decimal) -> None:
         live = self.orders.pop(side)
         self.apply_fill(side, live, amount)
-        self.base = live.price   # 체결된 '주문 가격'이 새 기준가
+        old_base = self.base
+        self.base = self.next_base(side, live.price)   # 매수=기준가×(1+매수율), 매도=기준가/(1+매수율)
         self.log("체결", f"{'매수' if side == 'buy' else '매도'} ${live.price} × {live.qty} "
                          f"(주문번호 {live.oder_no}, 체결금액 ${amount if amount > 0 else live.price * live.qty:,.2f}) "
-                         f"→ {self.ledger_text()}")
+                         f"→ {self.ledger_text()}, 기준가 ${old_base} → ${self.base}")
         self.notify()            # 장부·기준가를 먼저 저장한다 (이후 단계에서 멈춰도 기록은 남도록)
 
         other_side = "sell" if side == "buy" else "buy"
@@ -829,11 +844,12 @@ class Ladder:
             amount = Decimal(0)
         self.orders.pop(side, None)
         self.apply_fill(side, live, amount)
-        self.base = price      # 주문을 낸 시점의 현재가가 새 기준가
+        old_base = self.base
+        self.base = self.next_base(side, limit)   # 매수=기준가×(1+매수율), 매도=기준가/(1+매수율)
         self.ext = {"buy": None, "sell": None}
         self.log("체결", f"{'매수' if side == 'buy' else '매도'} 지정가 ${limit} × {live.qty} "
                          f"(주문번호 {live.oder_no}, 체결금액 ${amount if amount > 0 else limit * live.qty:,.2f}) "
-                         f"→ {self.ledger_text()}, 새 기준가 ${self.base}")
+                         f"→ {self.ledger_text()}, 기준가 ${old_base} → ${self.base}")
         self.notify()
         if self.fills >= self.max_fills:
             raise StopBot(f"--max-fills({self.max_fills}) 에 도달해 종료합니다.")
